@@ -1,81 +1,69 @@
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BBB → MP4</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; background: #f3f6fa; color: #172b45; font: 16px/1.5 system-ui, sans-serif; }
-    main { max-width: 680px; margin: 10vh auto; padding: 0 20px; }
-    .card { background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 32px; box-shadow: 0 10px 30px #172b450c; }
-    h1 { font-size: 28px; margin: 0 0 8px; }
-    p { color: #53657b; margin: 0 0 24px; }
-    label { font-weight: 600; display: block; margin-bottom: 8px; }
-    input { width: 100%; padding: 12px; border: 1px solid #a8b7c9; border-radius: 8px; font: inherit; }
-    input:focus { outline: 2px solid #3b82f6; outline-offset: 2px; }
-    button, .download { display: inline-block; background: #1d4ed8; color: white; border: 0; border-radius: 8px; padding: 12px 20px; font: inherit; font-weight: 600; cursor: pointer; text-decoration: none; }
-    button { margin-top: 16px; }
-    button:disabled { opacity: .55; cursor: wait; }
-    #status { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e2e8f0; }
-    #status:empty { display: none; }
-    .download { margin-top: 12px; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BBB → MP4 · задания</title>
+<style>
+:root { color-scheme: light; font-family: system-ui,-apple-system,sans-serif; color:#1b2941; background:#f5f7fb; }
+* {box-sizing:border-box} body {margin:0} .wrap {max-width:1500px; margin:auto; padding:30px 28px 20px}
+header {display:flex; align-items:center; gap:12px; margin-bottom:28px} .logo {display:grid; place-items:center; width:40px; height:40px; border-radius:12px; background:#294dd8; color:white; font-weight:800; font-size:13px}
+.brand {font-size:16px; font-weight:750} .brand small {display:block; font-size:12px; color:#7c899b; font-weight:500}
+.hero h1 {font-size:28px; line-height:1.2; margin:0 0 8px} .hero p {color:#68778e; margin:0 0 22px}
+.card {background:white; border:1px solid #e5eaf2; border-radius:13px; box-shadow:0 3px 16px #253a5e09}
+.formcard {padding:20px 22px; margin-bottom:22px} label {display:block; font-weight:650; font-size:14px; margin-bottom:8px}
+.formrow {display:flex; gap:10px} input {min-width:0; flex:1; padding:12px 14px; border:1px solid #cfd8e5; border-radius:8px; font:inherit; font-size:14px; outline-color:#5578ed}
+button, .action {cursor:pointer; font:inherit; text-decoration:none; border:1px solid #d7deea; background:white; color:#334762; border-radius:7px; padding:7px 10px; font-size:13px; font-weight:600; white-space:nowrap}
+button:hover, .action:hover {background:#f3f6fc} button:disabled {cursor:not-allowed; opacity:.5} .primary {background:#294dd8; color:white; border-color:#294dd8; padding:11px 18px; font-size:14px} .primary:hover {background:#1f40bd}
+#message {min-height:0; font-size:13px; color:#b33d3d; margin-top:8px} #message:empty {display:none}
+.list-head {display:flex; justify-content:space-between; align-items:center; padding:20px 22px; gap:12px} .list-head h2 {font-size:17px; margin:0} .list-head p {font-size:13px; color:#8290a3; margin:3px 0 0} .count {background:#eef2ff; border-radius:30px; color:#415cbd; padding:5px 11px; font-size:12px; font-weight:650; white-space:nowrap}
+.table-scroll {overflow-x:auto} table {border-collapse:collapse; width:100%; min-width:1080px; font-size:13px} th {text-align:left; color:#8995a7; font-weight:650; font-size:11px; letter-spacing:.05em; text-transform:uppercase; background:#f9fafc; padding:12px 16px; border-block:1px solid #edf0f5; white-space:nowrap}
+td {padding:16px; border-bottom:1px solid #edf0f5; vertical-align:middle} tbody tr:last-child td {border-bottom:0} .id {font-weight:650; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap} .link {color:#345acf; text-decoration:none} .link:hover {text-decoration:underline}
+.badge {display:inline-block; border-radius:30px; padding:5px 9px; background:#f0f3f8; color:#617087; font-size:12px; font-weight:650; white-space:nowrap}.running {background:#e9efff;color:#3358ce}.done {background:#e5f7ec;color:#278054}.failed,.stopped {background:#fff0ef;color:#b85151}.queued {background:#fff5df;color:#9a731e}
+.progress {width:100px; height:6px; border-radius:20px; background:#edf0f5; overflow:hidden; margin:6px 0}.progress span {display:block;height:100%;background:#4165e6;border-radius:20px}.muted {color:#99a5b4}.preview {display:block; width:120px; height:75px; object-fit:contain; background:#edf1f6; border-radius:6px}.actions {display:flex; flex-wrap:wrap; gap:6px; min-width:190px}.danger {color:#bb4d4d}.error {color:#bb4d4d; font-size:12px; max-width:200px; margin-top:5px}
+.empty {text-align:center;color:#8a98aa;padding:42px 16px} footer {color:#a0acbb; font-size:12px; padding:24px 2px; display:flex; justify-content:space-between}
+@media(max-width:650px){.wrap{padding:20px 14px}.formrow{flex-direction:column}.list-head{align-items:flex-start}.hero h1{font-size:24px}}
+</style>
 </head>
-<body>
-<main>
-  <div class="card">
-    <h1>Запись BBB в MP4</h1>
-    <p>Вставьте ссылку на опубликованную запись. После завершения конвертации появится ссылка на скачивание.</p>
-    <form id="form">
-      <label for="url">Playback URL</label>
-      <input id="url" name="url" type="url" required placeholder="https://bbb.example.com/playback/presentation/2.3/…">
-      <button id="submit" type="submit">Конвертировать</button>
-    </form>
-    <div id="status" role="status" aria-live="polite"></div>
-  </div>
-</main>
+<body><div class="wrap">
+<header><div class="logo">BBB</div><div class="brand">BBB → MP4<small>Конвертер записей</small></div></header>
+<section class="hero"><h1>Конвертация записей</h1><p>Добавьте ссылку на запись BigBlueButton и скачайте готовый MP4.</p></section>
+<section class="card formcard"><form id="form"><label for="url">Ссылка на запись</label><div class="formrow"><input id="url" type="url" required placeholder="https://bbb.example.com/playback/presentation/2.3/…"><button id="submit" class="primary" type="submit">Добавить задание</button></div><div id="message" role="status" aria-live="polite"></div></form></section>
+<section class="card"><div class="list-head"><div><h2>Задания</h2><p>Конвертация выполняется последовательно. Прогресс и время приблизительные.</p></div><div id="count" class="count">Загрузка…</div></div>
+<div class="table-scroll"><table><thead><tr><th>Запись</th><th>Ссылка</th><th>Статус</th><th>Осталось</th><th>Прогресс</th><th>Превью</th><th>Действия</th></tr></thead><tbody id="rows"></tbody></table></div><div id="empty" class="empty" hidden>Пока нет заданий. Добавьте ссылку выше.</div></section>
+<footer><span>BBB → MP4</span><span>v1.1.0</span></footer>
+</div>
 <script>
-  const form = document.getElementById('form');
-  const status = document.getElementById('status');
-  const button = document.getElementById('submit');
-  let timer;
-  function show(message, download) {
-    status.replaceChildren(document.createTextNode(message));
-    if (download) {
-      const br = document.createElement('br');
-      const link = document.createElement('a');
-      link.href = download;
-      link.className = 'download';
-      link.textContent = 'Скачать MP4';
-      status.append(br, link);
-    }
-  }
-  async function check(id) {
-    try {
-      const response = await fetch('/jobs/' + encodeURIComponent(id), {cache: 'no-store'});
-      const job = await response.json();
-      if (!response.ok) { sessionStorage.removeItem('job'); button.disabled = false; show('Задание не найдено. Возможно, сервис был перезапущен.'); return; }
-      if (job.status === 'done') { button.disabled = false; show('Конвертация завершена.', job.download); }
-      else if (job.status === 'failed') { sessionStorage.removeItem('job'); button.disabled = false; show(job.error); }
-      else { button.disabled = true; show(job.status === 'queued' ? 'Задание в очереди.' : 'Идёт конвертация. Это может занять время записи.'); timer = setTimeout(() => check(id), 3000); }
-    } catch (_) { show('Нет связи с сервисом. Повторная попытка…'); timer = setTimeout(() => check(id), 5000); }
-  }
-  form.addEventListener('submit', async event => {
-    event.preventDefault();
-    clearTimeout(timer);
-    button.disabled = true;
-    show('Отправка задания…');
-    try {
-      const response = await fetch('/jobs', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: document.getElementById('url').value})});
-      const result = await response.json();
-      if (!response.ok) { button.disabled = false; show(result.error); return; }
-      sessionStorage.setItem('job', result.id);
-      check(result.id);
-    } catch (_) { button.disabled = false; show('Не удалось отправить задание.'); }
-  });
-  const previous = sessionStorage.getItem('job');
-  if (previous) check(previous);
+const form = document.getElementById('form'), input = document.getElementById('url'), message = document.getElementById('message'), submit = document.getElementById('submit'), rows = document.getElementById('rows');
+const labels = {queued:'В очереди',running:'Конвертация',stopping:'Остановка',done:'Готово',failed:'Ошибка',stopped:'Остановлено'};
+function node(tag, text, cls) { const el = document.createElement(tag); if (text != null) el.textContent = text; if (cls) el.className = cls; return el; }
+function action(text, callback, cls) { const b = node('button',text,cls); b.type='button'; b.addEventListener('click',callback); return b; }
+function remaining(seconds) { if (seconds == null) return '—'; seconds = Math.max(0, Math.ceil(seconds)); const h=Math.floor(seconds/3600), m=Math.floor(seconds%3600/60), s=seconds%60; return (h ? h+' ч ' : '') + m+' мин '+String(s).padStart(2,'0')+' с'; }
+async function request(path, body) { const response = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const data=await response.json(); if (!response.ok) throw new Error(data.error || 'Ошибка запроса'); return data; }
+async function updateAction(job, op) {
+  if (op === 'delete' && !confirm('Удалить задание и его MP4-файл? Это действие нельзя отменить.')) return;
+  if (op === 'recreate' && job.has_file && !confirm('Пересоздать запись? Существующий MP4 будет заменён после конвертации.')) return;
+  try { message.textContent=''; await request('/jobs/'+job.id+'/'+op,{}); await refresh(); }
+  catch (err) { message.textContent=err.message; }
+}
+function render(job) {
+  const tr=node('tr');
+  let td=node('td'); const id=node('div',job.meeting_id,'id'); id.title=job.meeting_id; td.append(id); tr.append(td);
+  td=node('td'); if (job.url) { const a=node('a','Открыть ↗','link'); a.href=job.url; a.target='_blank'; a.rel='noopener noreferrer'; a.title=job.url; td.append(a); } else td.append(node('span','Неизвестна','muted')); tr.append(td);
+  td=node('td'); td.append(node('span',labels[job.status] || job.status,'badge '+job.status)); if(job.error) td.append(node('div',job.error,'error')); tr.append(td);
+  td=node('td',job.remaining != null && job.status!=='done' ? '~' + remaining(job.remaining) : remaining(job.remaining),job.remaining == null ? 'muted':''); tr.append(td);
+  td=node('td'); if(job.progress == null) td.append(node('span','—','muted')); else { td.append(node('div',(job.status==='done'?'':'~')+job.progress+'%')); const bar=node('div',null,'progress'), fill=node('span'); fill.style.width=job.progress+'%'; bar.append(fill); td.append(bar); } tr.append(td);
+  td=node('td'); if(job.preview) { const img=node('img',null,'preview'); img.src=job.preview+'?v='+job.screenshot_time; img.alt='Последний скриншот записи'; img.loading='lazy'; td.append(img); } else td.append(node('span','—','muted')); tr.append(td);
+  td=node('td'); const actions=node('div',null,'actions');
+  if (job.download) { const a=node('a',job.status==='done'?'Скачать':'Скачать прежний','action'); a.href=job.download; actions.append(a); }
+  if (job.status==='queued' || job.status==='running') actions.append(action(job.status==='queued'?'Убрать':'Остановить',()=>updateAction(job,'stop')));
+  else if(job.status==='stopping') { const b=action('Остановка…',()=>{}); b.disabled=true; actions.append(b); }
+  else { const b=action('Пересоздать',()=>updateAction(job,'recreate')); if(!job.url) {b.disabled=true; b.title='Введите URL записи в форме выше';} actions.append(b,action('Удалить',()=>updateAction(job,'delete'),'danger')); }
+  td.append(actions); tr.append(td); return tr;
+}
+let refreshing=false;
+async function refresh() { if(refreshing) return; refreshing=true; try { const response=await fetch('/jobs',{cache:'no-store'}); if(!response.ok) throw new Error('Не удалось загрузить задания.'); const jobs=await response.json(); rows.replaceChildren(...jobs.map(render)); document.getElementById('empty').hidden=jobs.length>0; document.getElementById('count').textContent='Всего: '+jobs.length+' · В очереди: '+jobs.filter(j=>j.status==='queued').length; } catch(err) {message.textContent=err.message || 'Нет связи с сервисом.';} finally {refreshing=false;} }
+form.addEventListener('submit',async e=>{ e.preventDefault(); submit.disabled=true; message.textContent=''; try { await request('/jobs',{url:input.value}); input.value=''; await refresh(); } catch(err) {message.textContent=err.message;} finally {submit.disabled=false;} });
+refresh(); setInterval(refresh,5000);
 </script>
-</body>
-</html>
+</body></html>
