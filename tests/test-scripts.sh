@@ -4,7 +4,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/repo with spaces" "$tmp/home"
-cp "$root/convert.sh" "$root/deploy.sh" "$root/web.py" "$root/web.html" "$tmp/repo with spaces/"
+cp "$root/convert.sh" "$root/deploy.sh" "$root/web.py" "$root/web.html" "$root/ffmpeg-cmd.sh" "$tmp/repo with spaces/"
 git -C "$tmp/repo with spaces" init -q
 cat > "$tmp/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
@@ -57,7 +57,18 @@ import sys
 args = open(sys.argv[1], 'rb').read().split(b'\0')[:-1]
 assert [a.decode() for a in args] == ['run', '--rm', '-v', sys.argv[2] + ':/usr/src/app/processed', '--env', 'REC_URL=' + sys.argv[3], 'manishkatyan/bbb-mp4']
 PY
+BBB_MP4_CONTAINER_NAME="bbb-mp4-11111111111111111111111111111111" BBB_MP4_SIZE=1280x720 \
+BBB_MP4_VIDEO_BITRATE=4000 BBB_MP4_AUDIO_BITRATE=192 BBB_MP4_PRESET=slow bash "$repo/convert.sh" "$url"
+python3 - "$DOCKER_ARGS" "$repo" <<'PYARGS'
+import sys
+args = [a.decode() for a in open(sys.argv[1], 'rb').read().split(b'\0')[:-1]]
+assert '--name' in args and 'bbb-mp4-11111111111111111111111111111111' in args
+assert sys.argv[2] + '/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro' in args
+assert all(x in args for x in ['BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow'])
+PYARGS
 rm "$DOCKER_ARGS"
+if BBB_MP4_SIZE=1280x720 BBB_MP4_VIDEO_BITRATE=0 BBB_MP4_AUDIO_BITRATE=192 BBB_MP4_PRESET=slow bash "$repo/convert.sh" "$url"; then echo 'Invalid bitrate accepted' >&2; exit 1; fi
+[[ ! -e $DOCKER_ARGS ]]
 for invalid in '' 'https://vks.vsesem.ru/other' 'https://vks.vsesem.ru/playback/presentation/2.3/../../x' 'https://vks.vsesem.ru/playback/presentation/2.3/f678f4a23ecaf2ac77135e744f2c9da8764c32dd-1793270594439/extra'; do
     if bash "$repo/convert.sh" "$invalid"; then echo 'Invalid URL accepted' >&2; exit 1; fi
     [[ ! -e $DOCKER_ARGS ]]
@@ -75,7 +86,7 @@ if [[ $1 == clone ]]; then
     printf '%s\n' "$*" >> "$GIT_CLONE_LOG"
     dest=${@: -1}
     mkdir -p "$dest"
-    cp "$TEST_ROOT/convert.sh" "$TEST_ROOT/deploy.sh" "$TEST_ROOT/web.py" "$TEST_ROOT/web.html" "$dest/"
+    cp "$TEST_ROOT/convert.sh" "$TEST_ROOT/deploy.sh" "$TEST_ROOT/web.py" "$TEST_ROOT/web.html" "$TEST_ROOT/ffmpeg-cmd.sh" "$dest/"
     "$REAL_GIT" -C "$dest" init -q
 else
     exec "$REAL_GIT" "$@"

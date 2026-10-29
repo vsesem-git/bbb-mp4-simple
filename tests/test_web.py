@@ -29,6 +29,7 @@ class WebTest(unittest.TestCase):
         self.addCleanup(setattr, web, 'ROOT', self.old_root)
         shutil.copy(ROOT / 'web.html', root)
         shutil.copy(ROOT / 'convert.sh', root)
+        shutil.copy(ROOT / 'ffmpeg-cmd.sh', root)
         (root / '.env').write_text('COPY_TO_LOCATION=' + shlex.quote(str(root / 'results with spaces')) + '\n')
         self.output = web.output_directory()
         self.output.mkdir()
@@ -36,14 +37,38 @@ class WebTest(unittest.TestCase):
         bin_dir.mkdir()
         docker = bin_dir / 'docker'
         docker.write_text('''#!/usr/bin/env python3
-import os, pathlib, sys, time
+import json, os, pathlib, sys, time
 args = sys.argv[1:]
 root = pathlib.Path(os.environ['MOCK_STATE'])
 with (root / 'calls').open('a') as log: log.write(' '.join(args[:4])+'\\n')
-if args[0] == 'run':
+if args[0] == 'run' and '--entrypoint' in args:
+    with (root / 'inspect-args').open('a') as log: log.write(json.dumps(args)+'\\n')
+    url = (root / 'received').read_text()
+    program = args[args.index('--entrypoint') + 1]
+    if program == 'ffmpeg':
+        if 'case=decodeerror' in url: print('corrupt video frame', file=sys.stderr); sys.exit(1)
+        sys.exit(0)
+    if 'case=probeerror' in url:
+        print('invalid mp4', file=sys.stderr); sys.exit(1)
+    if 'case=slowprobe' in url:
+        name = args[args.index('--name') + 1]
+        (root / (name + '.running')).touch()
+        for _ in range(150):
+            if (root / (name + '.stop')).exists(): sys.exit(143)
+            time.sleep(.05)
+    name = args[args.index('--name') + 1].replace('bbb-probe-', 'bbb-mp4-')
+    run_args = json.loads((root / (name + '.args')).read_text())
+    size = next((v.split('=',1)[1] for v in run_args if v.startswith('BBB_MP4_SIZE=')), '1280x800')
+    width, height = map(int, size.split('x'))
+    if 'case=wrongsize' in url: width += 2
+    video = {'codec_type':'video', 'width':width, 'height':height}
+    types = [video] if 'case=noaudio' in url else [video, {'codec_type':'audio'}]
+    print(json.dumps({'format':{'format_name':'mov,mp4,m4a,3gp,3g2,mj2','duration':'5.0'}, 'streams':types}))
+elif args[0] == 'run':
     name = args[args.index('--name') + 1]
-    mount = args[args.index('-v') + 1].split(':/usr/src/app/processed')[0]
-    url = args[args.index('--env') + 1][len('REC_URL='):]
+    mount = next(x[:-len(':/usr/src/app/processed')] for x in args if x.endswith(':/usr/src/app/processed'))
+    url = next(x[len('REC_URL='):] for x in args if x.startswith('REC_URL='))
+    (root / (name + '.args')).write_text(json.dumps(args))
     (root / 'received').write_text(url)
     # Simulate Docker taking time to create the named container.
     time.sleep(.2)
@@ -93,8 +118,8 @@ else: sys.exit(1)
         code, content = self.request(path, data)
         return code, json.loads(content)
 
-    def submit(self, url):
-        return self.json_request('/jobs', {'url': url})
+    def submit(self, url, settings=None):
+        return self.json_request('/jobs', {'url': url, 'settings': settings or {}})
 
     def await_state(self, job_id, states, timeout=7):
         deadline = time.monotonic() + timeout
@@ -183,6 +208,93 @@ else: sys.exit(1)
         self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
         self.assertEqual(self.await_state(job_id, {'stopped'})['status'], 'stopped')
         self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
+
+    def test_settings_snapshot_and_actual_container_arguments(self):
+        global_settings = {'resolution':'1280x720', 'video_bitrate':3333, 'audio_bitrate':192, 'preset':'slow'}
+        self.assertEqual(self.json_request('/settings', global_settings)[0], 200)
+        self.assertEqual(self.json_request('/settings', {**global_settings, 'video_bitrate':0})[0], 400)
+        self.assertEqual(self.json_request('/settings')[1], global_settings)
+        self.assertEqual(self.submit(URL, {'preset':'invalid'})[0], 400)
+        code, created = self.submit(URL, {'video_bitrate':'4000'})
+        self.assertEqual(code, 202)
+        job_id = created['id']
+        expected = {**global_settings, 'video_bitrate':4000}
+        self.assertEqual(self.json_request('/jobs/' + job_id)[1]['settings'], expected)
+        new_global = {**global_settings, 'video_bitrate':9000, 'resolution':'640x360'}
+        self.assertEqual(self.json_request('/settings', new_global)[0], 200)
+        job = self.await_state(job_id, {'done'})
+        self.assertEqual(job['settings'], expected)
+        self.assertEqual(job['verification']['duration'], 5.0)
+        inspections = [json.loads(line) for line in (web.ROOT / 'inspect-args').read_text().splitlines()]
+        self.assertEqual([x[x.index('--entrypoint')+1] for x in inspections], ['ffprobe', 'ffmpeg'])
+        self.assertTrue(all(any(arg.endswith(':/probe:ro') for arg in x) for x in inspections))
+        self.assertIn('-xerror', inspections[1])
+        self.assertIn('0:v:0', inspections[1])
+        self.assertIn('0:a:0', inspections[1])
+        args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
+        for arg in ('BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow'):
+            self.assertIn(arg, args)
+        self.assertTrue(any(x.endswith('/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro') for x in args))
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
+        self.await_state(job_id, {'done'})
+        self.assertEqual(self.json_request('/jobs/' + job_id)[1]['settings'], expected)
+        self.assertEqual(web.Jobs(self.output, web.ROOT / 'state').get_settings(), new_global)
+
+    def test_probe_rejects_missing_track_and_preserves_old_file(self):
+        target = self.output / (MEETING_ID + '.mp4')
+        target.write_bytes(b'previous good mp4')
+        job_id = self.submit(URL + '?case=noaudio')[1]['id']
+        job = self.await_state(job_id, {'failed'})
+        self.assertIn('аудиодорожка', job['error'])
+        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        code, log = self.json_request('/jobs/' + job_id + '/log')
+        self.assertEqual(code, 200)
+        self.assertIn('Проверка MP4', log['log'])
+        with self.server.jobs.condition:
+            self.server.jobs.jobs[job_id]['url'] = URL + '?case=probeerror'
+            self.server.jobs.save()
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
+        job = self.await_state(job_id, {'failed'})
+        self.assertIn('invalid mp4', job['error'])
+        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        with self.server.jobs.condition:
+            self.server.jobs.jobs[job_id]['url'] = URL + '?case=decodeerror'
+            self.server.jobs.save()
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
+        job = self.await_state(job_id, {'failed'})
+        self.assertIn('corrupt video frame', job['error'])
+        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        with self.server.jobs.condition:
+            self.server.jobs.jobs[job_id]['url'] = URL + '?case=wrongsize'
+            self.server.jobs.save()
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
+        job = self.await_state(job_id, {'failed'})
+        self.assertIn('разрешение', job['error'])
+        self.assertEqual(target.read_bytes(), b'previous good mp4')
+
+    def test_low_space_is_reported_and_recorded(self):
+        old = web.LOW_SPACE_BYTES
+        web.LOW_SPACE_BYTES = 2**100
+        self.addCleanup(setattr, web, 'LOW_SPACE_BYTES', old)
+        self.assertTrue(self.json_request('/disk')[1]['low'])
+        job_id = self.submit(URL)[1]['id']
+        self.assertTrue(self.await_state(job_id, {'running'})['space_warning'])
+        self.await_state(job_id, {'done'})
+        self.assertIn('меньше 1 ГиБ', self.json_request('/jobs/' + job_id + '/log')[1]['log'])
+
+    def test_stop_during_verification(self):
+        job_id = self.submit(URL + '?case=slowprobe')[1]['id']
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            job = self.json_request('/jobs/' + job_id)[1]
+            if job.get('phase') == 'verifying':
+                break
+            time.sleep(.05)
+        self.assertEqual(job.get('phase'), 'verifying')
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
+        self.assertEqual(self.await_state(job_id, {'stopped'})['status'], 'stopped')
+        self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
+        self.assertIn('stop --time 2 bbb-probe-' + job_id, (web.ROOT / 'calls').read_text())
 
     def test_recovery_stops_orphaned_container(self):
         job_id = '1' * 32

@@ -43,6 +43,24 @@ if [[ -n ${BBB_MP4_CONTAINER_NAME:-} ]]; then
     fi
     container_args=(--name "$BBB_MP4_CONTAINER_NAME")
 fi
+# Web jobs pass a validated snapshot; plain CLI calls retain upstream defaults.
+if [[ -n ${BBB_MP4_SIZE:-} ]]; then
+    if [[ ! $BBB_MP4_SIZE =~ ^(640x360|854x480|1280x720|1280x800|1920x1080)$ ]] ||
+       [[ ! ${BBB_MP4_VIDEO_BITRATE:-} =~ ^[0-9]{1,5}$ ]] ||
+       [[ ! ${BBB_MP4_AUDIO_BITRATE:-} =~ ^[0-9]{1,3}$ ]] ||
+       (( 10#$BBB_MP4_VIDEO_BITRATE < 250 || 10#$BBB_MP4_VIDEO_BITRATE > 50000 ||
+          10#$BBB_MP4_AUDIO_BITRATE < 32 || 10#$BBB_MP4_AUDIO_BITRATE > 512 )) ||
+       [[ ! ${BBB_MP4_PRESET:-} =~ ^(ultrafast|superfast|veryfast|faster|fast|medium|slow)$ ]] ||
+       [[ $script_dir == *:* || ! -f $script_dir/ffmpeg-cmd.sh ]]; then
+        echo 'Неверные параметры кодирования или путь к скрипту.' >&2
+        exit 1
+    fi
+    container_args+=(-v "$script_dir/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro"
+        --env "BBB_MP4_SIZE=$BBB_MP4_SIZE"
+        --env "BBB_MP4_VIDEO_BITRATE=$BBB_MP4_VIDEO_BITRATE"
+        --env "BBB_MP4_AUDIO_BITRATE=$BBB_MP4_AUDIO_BITRATE"
+        --env "BBB_MP4_PRESET=$BBB_MP4_PRESET")
+fi
 docker run --rm "${container_args[@]}" \
     -v "$COPY_TO_LOCATION:/usr/src/app/processed" \
     --env "REC_URL=$url" \
