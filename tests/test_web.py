@@ -21,6 +21,9 @@ URL = 'https://vks.vsesem.ru/playback/presentation/2.3/' + MEETING_ID
 
 class WebTest(unittest.TestCase):
     def setUp(self):
+        old_delay = web.RETRY_DELAY
+        web.RETRY_DELAY = .05
+        self.addCleanup(setattr, web, 'RETRY_DELAY', old_delay)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
@@ -61,9 +64,13 @@ if args[0] == 'run' and '--entrypoint' in args:
     size = next((v.split('=',1)[1] for v in run_args if v.startswith('BBB_MP4_SIZE=')), '1280x800')
     width, height = map(int, size.split('x'))
     if 'case=wrongsize' in url: width += 2
-    video = {'codec_type':'video', 'width':width, 'height':height}
+    codec = next((v.split('=',1)[1] for v in run_args if v.startswith('BBB_MP4_CODEC=')), 'h264')
+    codec = 'hevc' if codec == 'h265' else 'h264'
+    if 'case=wrongcodec' in url: codec = 'mpeg4'
+    video = {'codec_type':'video', 'codec_name':codec, 'width':width, 'height':height}
     types = [video] if 'case=noaudio' in url else [video, {'codec_type':'audio'}]
-    print(json.dumps({'format':{'format_name':'mov,mp4,m4a,3gp,3g2,mj2','duration':'5.0'}, 'streams':types}))
+    duration = '1.0' if 'case=short' in url else '5.0'
+    print(json.dumps({'format':{'format_name':'mov,mp4,m4a,3gp,3g2,mj2','duration':duration}, 'streams':types}))
 elif args[0] == 'run':
     name = args[args.index('--name') + 1]
     mount = next(x[:-len(':/usr/src/app/processed')] for x in args if x.endswith(':/usr/src/app/processed'))
@@ -76,9 +83,16 @@ elif args[0] == 'run':
     (root / (name + '.running')).touch()
     print('5.0', flush=True)
     print('stderr: Output #0, mp4, to output.mp4', flush=True)
-    for _ in range(40):
-        if (root / (name + '.stop')).exists(): sys.exit(143)
+    for _ in range(20):
+        if (root / (name + '.stop')).exists():
+            (root / (name + '.running')).unlink(missing_ok=True); sys.exit(143)
         time.sleep(.05)
+    (root / (name + '.running')).unlink(missing_ok=True)
+    count_file = root / (name + '.attempts')
+    attempt = int(count_file.read_text()) + 1 if count_file.exists() else 1
+    count_file.write_text(str(attempt))
+    if 'case=notfound' in url: print('Recording not found!', flush=True); sys.exit(1)
+    if 'case=transient' in url and attempt == 1: print('Chrome crashed', flush=True); sys.exit(1)
     if 'case=fail' in url: sys.exit(1)
     if 'case=stale' not in url:
         mid = url.split('/')[6].split('?')[0].split('#')[0]
@@ -118,10 +132,10 @@ else: sys.exit(1)
         code, content = self.request(path, data)
         return code, json.loads(content)
 
-    def submit(self, url, settings=None):
-        return self.json_request('/jobs', {'url': url, 'settings': settings or {}})
+    def submit(self, url, settings=None, replace_confirmed=False):
+        return self.json_request('/jobs', {'url': url, 'settings': settings or {}, 'replace_confirmed':replace_confirmed})
 
-    def await_state(self, job_id, states, timeout=7):
+    def await_state(self, job_id, states, timeout=12):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             code, job = self.json_request('/jobs/' + job_id)
@@ -161,6 +175,10 @@ else: sys.exit(1)
         self.assertGreaterEqual((web.ROOT / 'calls').read_text().count('exec bbb-mp4-' + job_id), 2)
         self.assertEqual((web.ROOT / 'received').read_text(), url)
         self.assertEqual(job['progress'], 100)
+        self.assertEqual(job['file_size'], len(b'test mp4'))
+        self.assertEqual(job['file_duration'], 5.0)
+        self.assertEqual(job['settings']['codec'], 'h264')
+        self.assertIsNone(job['settings']['video_bitrate'])
         self.assertEqual(self.request(job['download']), (200, b'test mp4'))
         self.assertEqual(self.request('/download/../.env')[0], 404)
         self.assertEqual(len(self.json_request('/jobs')[1]), 2)
@@ -168,9 +186,9 @@ else: sys.exit(1)
         self.await_state(job_id, {'running'})
         self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
         self.await_state(job_id, {'stopped'})
-        # A cancelled recreation does not remove the previously completed file.
-        self.assertTrue((self.output / (MEETING_ID + '.mp4')).exists())
-        self.assertEqual(self.request(self.json_request('/jobs/' + job_id)[1]['download'])[1], b'test mp4')
+        # The old file was deleted immediately when recreation was requested.
+        self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
+        self.assertIsNone(self.json_request('/jobs/' + job_id)[1]['download'])
         self.assertEqual(self.json_request('/jobs/' + job_id + '/delete', {})[0], 202)
         self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
         self.assertFalse(list(self.output.glob('.bbb-mp4-*')))
@@ -210,7 +228,7 @@ else: sys.exit(1)
         self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
 
     def test_settings_snapshot_and_actual_container_arguments(self):
-        global_settings = {'resolution':'1280x720', 'video_bitrate':3333, 'audio_bitrate':192, 'preset':'slow'}
+        global_settings = {'resolution':'1280x720', 'video_bitrate':3333, 'audio_bitrate':192, 'preset':'slow', 'codec':'h265'}
         self.assertEqual(self.json_request('/settings', global_settings)[0], 200)
         self.assertEqual(self.json_request('/settings', {**global_settings, 'video_bitrate':0})[0], 400)
         self.assertEqual(self.json_request('/settings')[1], global_settings)
@@ -232,7 +250,7 @@ else: sys.exit(1)
         self.assertIn('0:v:0', inspections[1])
         self.assertIn('0:a:0', inspections[1])
         args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
-        for arg in ('BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow'):
+        for arg in ('BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow','BBB_MP4_CODEC=h265'):
             self.assertIn(arg, args)
         self.assertTrue(any(x.endswith('/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro') for x in args))
         self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
@@ -240,13 +258,16 @@ else: sys.exit(1)
         self.assertEqual(self.json_request('/jobs/' + job_id)[1]['settings'], expected)
         self.assertEqual(web.Jobs(self.output, web.ROOT / 'state').get_settings(), new_global)
 
-    def test_probe_rejects_missing_track_and_preserves_old_file(self):
+    def test_probe_rejects_missing_track_and_deletes_old_file(self):
         target = self.output / (MEETING_ID + '.mp4')
         target.write_bytes(b'previous good mp4')
-        job_id = self.submit(URL + '?case=noaudio')[1]['id']
+        self.assertEqual(self.submit(URL + '?case=noaudio')[0], 409)
+        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        job_id = self.submit(URL + '?case=noaudio', replace_confirmed=True)[1]['id']
+        self.assertFalse(target.exists())
         job = self.await_state(job_id, {'failed'})
         self.assertIn('аудиодорожка', job['error'])
-        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        self.assertFalse(target.exists())
         code, log = self.json_request('/jobs/' + job_id + '/log')
         self.assertEqual(code, 200)
         self.assertIn('Проверка MP4', log['log'])
@@ -256,21 +277,68 @@ else: sys.exit(1)
         self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
         job = self.await_state(job_id, {'failed'})
         self.assertIn('invalid mp4', job['error'])
-        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        self.assertFalse(target.exists())
         with self.server.jobs.condition:
             self.server.jobs.jobs[job_id]['url'] = URL + '?case=decodeerror'
             self.server.jobs.save()
         self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
         job = self.await_state(job_id, {'failed'})
         self.assertIn('corrupt video frame', job['error'])
-        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        self.assertFalse(target.exists())
         with self.server.jobs.condition:
             self.server.jobs.jobs[job_id]['url'] = URL + '?case=wrongsize'
             self.server.jobs.save()
         self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
         job = self.await_state(job_id, {'failed'})
         self.assertIn('разрешение', job['error'])
-        self.assertEqual(target.read_bytes(), b'previous good mp4')
+        self.assertFalse(target.exists())
+
+    def test_retry_transient_and_permanent_failure(self):
+        job_id = self.submit(URL + '?case=transient')[1]['id']
+        job = self.await_state(job_id, {'done'})
+        self.assertEqual(job['attempt'], 2)
+        self.assertIn('Повтор через', self.json_request('/jobs/' + job_id + '/log')[1]['log'])
+        bad_id = 'c' * 40 + '-1234567890123'
+        failed_id = self.submit(URL.replace(MEETING_ID, bad_id) + '?case=notfound')[1]['id']
+        failed = self.await_state(failed_id, {'failed'})
+        self.assertEqual(failed['attempt'], 1)
+
+    def test_short_result_is_retried_and_not_published(self):
+        job_id = self.submit(URL + '?case=short')[1]['id']
+        job = self.await_state(job_id, {'failed'})
+        self.assertEqual(job['attempt'], 3)
+        self.assertIn('короче', job['error'])
+        self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
+
+    def test_exhausted_retries_and_stop_while_waiting(self):
+        old_delay = web.RETRY_DELAY
+        web.RETRY_DELAY = 2
+        try:
+            job_id = self.submit(URL + '?case=fail')[1]['id']
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                job = self.json_request('/jobs/' + job_id)[1]
+                if job['status'] == 'queued' and job.get('attempt') == 1:
+                    break
+                time.sleep(.05)
+            self.assertEqual(job['status'], 'queued')
+            self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
+            self.assertEqual(self.await_state(job_id, {'stopped'})['attempt'], 1)
+        finally:
+            web.RETRY_DELAY = old_delay
+        other = 'd' * 40 + '-1234567890123'
+        failed_id = self.submit(URL.replace(MEETING_ID, other) + '?case=fail')[1]['id']
+        self.assertEqual(self.await_state(failed_id, {'failed'})['attempt'], 3)
+
+    def test_legacy_settings_and_metadata(self):
+        state = web.ROOT / 'legacy'
+        state.mkdir()
+        legacy = {'resolution':'1280x800', 'video_bitrate':2500, 'audio_bitrate':128, 'preset':'fast'}
+        (state / 'settings.json').write_text(json.dumps(legacy))
+        jobs = web.Jobs(self.output, state)
+        self.assertEqual(jobs.get_settings(), {**legacy, 'codec':'h264'})
+        self.assertEqual(web.DEFAULT_SETTINGS['codec'], 'h264')
+        self.assertIsNone(web.DEFAULT_SETTINGS['video_bitrate'])
 
     def test_low_space_is_reported_and_recorded(self):
         old = web.LOW_SPACE_BYTES
@@ -307,12 +375,15 @@ else: sys.exit(1)
              'status':'running','run_id':'2'*32,'created':time.time(), 'duration':5,
              'capture_started':time.time(), 'screenshot_time':None, 'error':None},
             {'id':queued_id, 'meeting_id':other_id, 'url':URL.replace(MEETING_ID, other_id),
-             'status':'queued','run_id':'4'*32,'created':time.time(), 'queued_at':time.time_ns(),
+             'status':'queued','run_id':'4'*32,'cleanup_run_id':'5'*32,'created':time.time(), 'queued_at':time.time_ns(),
              'duration':None, 'capture_started':None, 'screenshot_time':None, 'error':None}]))
         workspace = self.output / ('.bbb-mp4-' + job_id + '-' + '2'*32)
         workspace.mkdir()
         (workspace / 'partial.mp4').write_bytes(b'incomplete')
+        old_workspace = self.output / ('.bbb-mp4-' + queued_id + '-' + '5'*32)
+        old_workspace.mkdir()
         jobs = web.Jobs(self.output, state)
+        self.assertFalse(old_workspace.exists())
         self.assertFalse(workspace.exists())
         self.assertEqual(jobs.get(job_id)['status'], 'stopped')
         self.assertTrue((web.ROOT / ('bbb-mp4-' + job_id + '.stop')).exists())

@@ -8,11 +8,22 @@ DISPLAY_NUMBER=$3
 WIDTH=${BBB_MP4_SIZE%x*}
 HEIGHT=${BBB_MP4_SIZE#*x}
 
+case "${BBB_MP4_CODEC:-h264}" in
+    h264) CRF=22; set -- -c:v libx264 ;;
+    h265) CRF=26; set -- -c:v libx265 -tag:v hvc1 -x265-params pools=2:log-level=error ;;
+    *) echo 'Unsupported codec' >&2; exit 1 ;;
+esac
+if [ "$BBB_MP4_VIDEO_BITRATE" = auto ]; then
+    set -- "$@" -crf "$CRF"
+else
+    set -- "$@" -b:v "${BBB_MP4_VIDEO_BITRATE}k"
+fi
+
 ffmpeg -y -nostats -draw_mouse 0 -s 1280x800 \
     -framerate 30 -f x11grab -thread_queue_size 1024 -i ":$DISPLAY_NUMBER" \
     -f alsa -thread_queue_size 1024 -itsoffset 0.57 -i pulse -ac 2 \
     -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1" \
-    -c:v libx264 -b:v "${BBB_MP4_VIDEO_BITRATE}k" \
+    "$@" \
     -c:a aac -b:a "${BBB_MP4_AUDIO_BITRATE}k" \
     -pix_fmt yuv420p -preset "$BBB_MP4_PRESET" -movflags faststart \
     -t "$DURATION" "/usr/src/app/processing/$EXPORT_NAME.mp4"

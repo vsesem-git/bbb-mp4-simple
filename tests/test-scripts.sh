@@ -66,7 +66,15 @@ assert '--name' in args and 'bbb-mp4-11111111111111111111111111111111' in args
 assert sys.argv[2] + '/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro' in args
 assert all(x in args for x in ['BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow'])
 PYARGS
+BBB_MP4_SIZE=1280x800 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium BBB_MP4_CODEC=h265 bash "$repo/convert.sh" "$url"
+python3 - "$DOCKER_ARGS" <<'PYARGS'
+import sys
+args = [a.decode() for a in open(sys.argv[1], 'rb').read().split(b'\0')[:-1]]
+assert 'BBB_MP4_VIDEO_BITRATE=auto' in args and 'BBB_MP4_CODEC=h265' in args
+PYARGS
 rm "$DOCKER_ARGS"
+if BBB_MP4_SIZE=1280x720 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium BBB_MP4_CODEC=unsafe bash "$repo/convert.sh" "$url"; then echo 'Invalid codec accepted' >&2; exit 1; fi
+[[ ! -e $DOCKER_ARGS ]]
 if BBB_MP4_SIZE=1280x720 BBB_MP4_VIDEO_BITRATE=0 BBB_MP4_AUDIO_BITRATE=192 BBB_MP4_PRESET=slow bash "$repo/convert.sh" "$url"; then echo 'Invalid bitrate accepted' >&2; exit 1; fi
 [[ ! -e $DOCKER_ARGS ]]
 for invalid in '' 'https://vks.vsesem.ru/other' 'https://vks.vsesem.ru/playback/presentation/2.3/../../x' 'https://vks.vsesem.ru/playback/presentation/2.3/f678f4a23ecaf2ac77135e744f2c9da8764c32dd-1793270594439/extra'; do

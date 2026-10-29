@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +24,9 @@ TRUSTED_NETWORKS = tuple(ipaddress.ip_network(net) for net in
 ACTIVE = {'queued', 'running', 'stopping'}
 RESOLUTIONS = {'640x360', '854x480', '1280x720', '1280x800', '1920x1080'}
 PRESETS = {'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'}
-DEFAULT_SETTINGS = {'resolution': '1280x800', 'video_bitrate': 2500, 'audio_bitrate': 128, 'preset': 'fast'}
+DEFAULT_SETTINGS = {'resolution': '1280x800', 'video_bitrate': None, 'audio_bitrate': 128, 'preset': 'medium', 'codec': 'h264'}
+MAX_ATTEMPTS = 3
+RETRY_DELAY = 5
 LOW_SPACE_BYTES = 1024 ** 3
 LOG_LIMIT = 16000
 
@@ -33,15 +36,17 @@ def validate_settings(values, base=None):
         raise ValueError('Неизвестные параметры конвертации.')
     result = dict(DEFAULT_SETTINGS if base is None else base)
     for key, value in values.items():
-        if key in ('video_bitrate', 'audio_bitrate'):
+        if key == 'video_bitrate' and (value is None or value in ('auto', 'авто')):
+            value = None
+        elif key in ('video_bitrate', 'audio_bitrate'):
             if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isascii() or not str(value).isdigit():
                 raise ValueError('Битрейт должен быть целым числом в кбит/с.')
             value = int(value)
             minimum, maximum = (250, 50000) if key == 'video_bitrate' else (32, 512)
             if not minimum <= value <= maximum:
                 raise ValueError(f'Битрейт {key} должен быть от {minimum} до {maximum} кбит/с.')
-        elif not isinstance(value, str) or value not in (RESOLUTIONS if key == 'resolution' else PRESETS):
-            raise ValueError('Недопустимое разрешение или пресет кодирования.')
+        elif not isinstance(value, str) or value not in (RESOLUTIONS if key == 'resolution' else {'h264', 'h265'} if key == 'codec' else PRESETS):
+            raise ValueError('Недопустимое разрешение, кодек или пресет кодирования.')
         result[key] = value
     return result
 
@@ -81,6 +86,65 @@ def signature(path):
         return None
 
 
+def mp4_duration(path):
+    """Read movie duration from the bounded MP4 atom tree without decoding."""
+    try:
+        with path.open('rb') as f:
+            size = os.fstat(f.fileno()).st_size
+            def boxes(start, end):
+                position = start
+                for _ in range(100000):
+                    if position + 8 > end:
+                        return
+                    f.seek(position)
+                    header = f.read(8)
+                    if len(header) != 8:
+                        return
+                    length, kind = struct.unpack('>I4s', header)
+                    header_size = 8
+                    if length == 1:
+                        ext = f.read(8)
+                        if len(ext) != 8:
+                            return
+                        length, header_size = struct.unpack('>Q', ext)[0], 16
+                    elif length == 0:
+                        length = end - position
+                    if length < header_size or position + length > end:
+                        return
+                    yield kind, position + header_size, position + length
+                    position += length
+            for kind, start, end in boxes(0, size):
+                if kind != b'moov':
+                    continue
+                for sub, mv_start, mv_end in boxes(start, end):
+                    if sub != b'mvhd':
+                        continue
+                    f.seek(mv_start)
+                    data = f.read(min(mv_end - mv_start, 32))
+                    if len(data) >= 20 and data[0] == 0:
+                        scale, duration = struct.unpack('>II', data[12:20])
+                    elif len(data) >= 32 and data[0] == 1:
+                        scale, duration = struct.unpack('>IQ', data[20:32])
+                    else:
+                        return None
+                    if scale and duration not in (0, 0xffffffff, 0xffffffffffffffff):
+                        return duration / scale
+                    return None
+    except (OSError, ValueError, struct.error):
+        return None
+    return None
+
+
+class ConfirmationRequired(ValueError):
+    pass
+
+
+class ConversionError(RuntimeError):
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class Jobs:
     def __init__(self, output, state_dir=None, screenshot_interval=60, retry_interval=5):
         self.output = Path(output)
@@ -94,14 +158,16 @@ class Jobs:
         self.screenshot_interval = screenshot_interval
         self.retry_interval = retry_interval
         self.jobs = {}
+        self.file_metadata = {}
         if self.state_file.exists():
             # Fail closed on corrupt state, rather than lose jobs or overwrite files.
             data = json.loads(self.state_file.read_text(encoding='utf-8'))
             for job in data:
                 if not JOB_RE.fullmatch(job['id']) or not FILE_RE.fullmatch(job['meeting_id'] + '.mp4'):
                     raise ValueError('Некорректный файл состояния заданий')
-                if job.get('run_id') is not None and not JOB_RE.fullmatch(job['run_id']):
-                    raise ValueError('Некорректный идентификатор запуска')
+                for key in ('run_id', 'cleanup_run_id'):
+                    if job.get(key) is not None and not JOB_RE.fullmatch(job[key]):
+                        raise ValueError('Некорректный идентификатор запуска')
                 # Older jobs retain the original image's encoding settings.
                 if job.get('settings') is not None:
                     job['settings'] = validate_settings(job['settings'])
@@ -155,6 +221,9 @@ class Jobs:
                 job.update(status='stopped', error='Прервано при перезапуске сервиса.', duration=None, capture_started=None)
             if job.get('run_id'):
                 self.remove_workspace(job['id'], job['run_id'])
+            if job.get('cleanup_run_id'):
+                self.remove_workspace(job['id'], job['cleanup_run_id'])
+                job.pop('cleanup_run_id', None)
 
     def workspace(self, job_id, run_id):
         return self.output / ('.bbb-mp4-' + job_id + '-' + run_id)
@@ -179,9 +248,20 @@ class Jobs:
     def snapshot(self, job):
         item = dict(job)
         item.pop('run_id', None)
+        item.pop('cleanup_run_id', None)
         item.pop('log_tail', None)
         target = self.output / (job['meeting_id'] + '.mp4')
         item['has_file'] = target.is_file()
+        item['file_size'] = item['file_duration'] = None
+        if item['has_file']:
+            current = signature(target)
+            if current:
+                cached = self.file_metadata.get(target.name)
+                if not cached or cached[0] != current:
+                    cached = (current, mp4_duration(target))
+                    self.file_metadata[target.name] = cached
+                item['file_size'] = current[2]
+                item['file_duration'] = cached[1] or (job.get('verification') or {}).get('duration') or job.get('duration')
         item['download'] = '/download/' + target.name if item['has_file'] else None
         if job['status'] == 'done' and not item['has_file']:
             item['error'] = 'MP4-файл не найден на диске.'
@@ -206,16 +286,24 @@ class Jobs:
             job = self.jobs.get(job_id)
             return self.snapshot(job) if job else None
 
-    def enqueue(self, job):
+    def check_queue_capacity(self):
         if sum(j.get('status') == 'queued' for j in self.jobs.values()) >= 100:
             raise ValueError('Очередь заполнена. Попробуйте позже.')
+
+    def remove_result(self, meeting_id):
+        target = self.output / (meeting_id + '.mp4')
+        target.unlink(missing_ok=True)
+        self.file_metadata.pop(target.name, None)
+
+    def enqueue(self, job):
+        self.check_queue_capacity()
         job.update(status='queued', queued_at=time.time_ns(), run_id=secrets.token_hex(16), duration=None,
-                   capture_started=None, screenshot_time=None, error=None, phase=None, log_tail='', space_warning=False, verification=None)
+                   capture_started=None, screenshot_time=None, error=None, phase=None, log_tail='', space_warning=False, verification=None, attempt=0, next_attempt=0)
         (self.state_dir / (job['id'] + '.jpg')).unlink(missing_ok=True)
         self.save()
         self.condition.notify()
 
-    def submit(self, url, overrides=None):
+    def submit(self, url, overrides=None, replace_confirmed=False):
         match = URL_RE.fullmatch(url)
         if not match:
             raise ValueError('Неверный playback URL BigBlueButton 2.3.')
@@ -225,11 +313,21 @@ class Jobs:
             existing = next((j for j in self.jobs.values() if j['meeting_id'] == meeting_id), None)
             if existing:
                 if existing['url'] is None and existing['status'] not in ACTIVE:
+                    self.check_queue_capacity()
+                    if (self.output / (meeting_id + '.mp4')).exists():
+                        if replace_confirmed is not True:
+                            raise ConfirmationRequired('Предыдущий MP4 будет удалён сразу. Продолжить?')
+                        self.remove_result(meeting_id)
                     existing['url'] = url
                     existing['settings'] = settings
                     self.enqueue(existing)
                     return existing['id']
                 raise ValueError('Эта запись уже есть в списке заданий.')
+            self.check_queue_capacity()
+            if (self.output / (meeting_id + '.mp4')).exists():
+                if replace_confirmed is not True:
+                    raise ConfirmationRequired('Предыдущий MP4 будет удалён сразу. Продолжить?')
+                self.remove_result(meeting_id)
             job_id = secrets.token_hex(16)
             job = {'id': job_id, 'meeting_id': meeting_id, 'url': url, 'created': time.time(), 'settings': settings}
             self.jobs[job_id] = job
@@ -258,12 +356,14 @@ class Jobs:
                     raise ValueError('Дождитесь завершения или остановите задание.')
                 if not job.get('url'):
                     raise ValueError('Для старого файла неизвестен URL. Вставьте его в форму выше.')
+                self.check_queue_capacity()
+                self.remove_result(job['meeting_id'])
                 self.enqueue(job)
             elif action == 'delete':
                 if job['status'] in ACTIVE:
                     raise ValueError('Сначала остановите задание.')
                 # Delete the recording only on an explicit delete action.
-                (self.output / (job['meeting_id'] + '.mp4')).unlink(missing_ok=True)
+                self.remove_result(job['meeting_id'])
                 (self.state_dir / (job_id + '.jpg')).unlink(missing_ok=True)
                 del self.jobs[job_id]
                 self.save()
@@ -352,7 +452,7 @@ class Jobs:
                     cleanup = subprocess.run(['docker', 'rm', '-f', name], capture_output=True, text=True, timeout=30)
                     if cleanup.returncode and 'No such container' not in cleanup.stderr:
                         raise RuntimeError('Не удалось остановить контейнер проверки: ' + cleanup.stderr.strip())
-                    raise RuntimeError('Превышено время проверки MP4.')
+                    raise ConversionError('Превышено время проверки MP4.', retryable=True)
         with self.condition:
             stopping = self.jobs[job_id]['status'] == 'stopping'
         if stopping:
@@ -361,14 +461,14 @@ class Jobs:
                 raise RuntimeError('Не удалось подтвердить остановку контейнера проверки: ' + cleanup.stderr.strip())
             return None
         if process.returncode:
-            raise RuntimeError(program + ' не смог проверить MP4: ' + (stderr.strip()[-500:] or f'код {process.returncode}'))
+            raise ConversionError(program + ' не смог проверить MP4: ' + (stderr.strip()[-500:] or f'код {process.returncode}'), process.returncode not in (125, 126, 127))
         return stdout
 
     def probe(self, job_id, staged, settings):
         """Check the container/streams and decode the entire new MP4."""
         file = '/probe/' + staged.name
         stdout = self.inspect_container(job_id, staged, 'ffprobe', [
-            '-v', 'error', '-show_entries', 'format=format_name,duration:stream=codec_type,width,height',
+            '-v', 'error', '-show_entries', 'format=format_name,duration:stream=codec_type,codec_name,width,height',
             '-of', 'json', file], 60)
         if stdout is None:
             return None
@@ -386,8 +486,10 @@ class Jobs:
                 expected = tuple(int(v) for v in settings['resolution'].split('x'))
                 if (video.get('width'), video.get('height')) != expected:
                     raise ValueError('разрешение MP4 не соответствует настройкам задания')
+                if video.get('codec_name') != ('hevc' if settings['codec'] == 'h265' else 'h264'):
+                    raise ValueError('кодек MP4 не соответствует настройкам задания')
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-            raise RuntimeError('MP4 не прошёл проверку: ' + str(exc)) from exc
+            raise ConversionError('MP4 не прошёл проверку: ' + str(exc), not any(key in str(exc) for key in ('разрешение', 'кодек'))) from exc
         with self.condition:
             self.log(self.jobs[job_id], 'Проверка декодирования видео и аудио…\n')
         decoded = self.inspect_container(job_id, staged, 'ffmpeg', [
@@ -398,12 +500,19 @@ class Jobs:
     def worker(self):
         while True:
             with self.condition:
-                job = min((j for j in self.jobs.values() if j['status'] == 'queued'), key=lambda j: j.get('queued_at', 0), default=None)
-                if not job:
-                    self.condition.wait()
+                queued = [j for j in self.jobs.values() if j['status'] == 'queued']
+                now = time.time()
+                ready = [j for j in queued if j.get('next_attempt', 0) <= now]
+                if not ready:
+                    delay = max(0.01, min(j.get('next_attempt', 0) for j in queued) - now) if queued else None
+                    self.condition.wait(timeout=delay)
                     continue
+                job = min(ready, key=lambda j: j.get('queued_at', 0))
                 job['status'] = 'running'
+                job['attempt'] = job.get('attempt', 0) + 1
+                job['error'] = None
                 job['phase'] = 'preparing'
+                self.log(job, f"\nПопытка {job['attempt']} из {MAX_ATTEMPTS}.\n")
                 try:
                     job['space_warning'] = self.disk_info()['low']
                 except OSError as exc:
@@ -426,11 +535,12 @@ class Jobs:
                 settings = job.get('settings')
                 if settings is not None:
                     env.update(BBB_MP4_SIZE=settings['resolution'],
-                               BBB_MP4_VIDEO_BITRATE=str(settings['video_bitrate']),
+                               BBB_MP4_VIDEO_BITRATE='auto' if settings['video_bitrate'] is None else str(settings['video_bitrate']),
+                               BBB_MP4_CODEC=settings['codec'],
                                BBB_MP4_AUDIO_BITRATE=str(settings['audio_bitrate']),
                                BBB_MP4_PRESET=settings['preset'])
                 else:
-                    for key in ('BBB_MP4_SIZE', 'BBB_MP4_VIDEO_BITRATE', 'BBB_MP4_AUDIO_BITRATE', 'BBB_MP4_PRESET'):
+                    for key in ('BBB_MP4_SIZE', 'BBB_MP4_VIDEO_BITRATE', 'BBB_MP4_AUDIO_BITRATE', 'BBB_MP4_PRESET', 'BBB_MP4_CODEC'):
                         env.pop(key, None)
                 process = subprocess.Popen([str(ROOT / 'convert.sh'), url], cwd=ROOT, env=env,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -461,10 +571,11 @@ class Jobs:
                         job.update(status='stopped', error=None)
                         self.save()
                         continue
+                    permanent = any(text in job.get('log_tail', '') for text in ('Recording not found!', 'Invalid recording URL'))
                     if process.returncode != 0:
-                        raise RuntimeError(f'Контейнер конвертации завершился с кодом {process.returncode}.')
+                        raise ConversionError(f'Контейнер конвертации завершился с кодом {process.returncode}.', not permanent and process.returncode not in (125, 126, 127))
                     if after is None or after[2] == 0:
-                        raise RuntimeError('Конвертер не создал непустой MP4. Проверьте сообщения FFmpeg в журнале.')
+                        raise ConversionError('Конвертер не создал непустой MP4. Проверьте сообщения FFmpeg в журнале.', not permanent)
                     job['phase'] = 'verifying'
                     self.log(job, '\nПроверка MP4: метаданные и декодирование…\n')
                     self.save()
@@ -473,6 +584,9 @@ class Jobs:
                     if job['status'] == 'stopping' or verification is None:
                         job.update(status='stopped', error=None)
                     else:
+                        expected = job.get('duration')
+                        if expected and verification['duration'] + max(2, expected * .01) < expected:
+                            raise ConversionError('MP4 короче записи: конвертация могла прерваться.', retryable=True)
                         os.replace(staged, target)
                         job.update(status='done', phase=None, verification=verification, error=None)
                         self.log(job, 'MP4: контейнер, длительность и декодирование видео- и аудиодорожек проверены.\n')
@@ -480,13 +594,29 @@ class Jobs:
             except Exception as exc:
                 print('Conversion failed:', exc, flush=True)
                 with self.condition:
-                    job.update(status='failed', phase=None, error=str(exc)[:700])
                     self.log(job, '\nОшибка: ' + str(exc) + '\n')
+                    retry = (job['status'] != 'stopping' and isinstance(exc, ConversionError)
+                             and exc.retryable and job.get('attempt', 0) < MAX_ATTEMPTS)
+                    if retry:
+                        delay = RETRY_DELAY * (2 ** (job['attempt'] - 1))
+                        job.update(status='queued', phase=None, error='Повтор после ошибки: ' + str(exc)[:600],
+                                   next_attempt=time.time() + delay, queued_at=time.time_ns(),
+                                   run_id=secrets.token_hex(16), cleanup_run_id=run_id, duration=None, capture_started=None,
+                                   screenshot_time=None, verification=None)
+                        (self.state_dir / (job_id + '.jpg')).unlink(missing_ok=True)
+                        self.log(job, f'Повтор через {delay:g} с.\n')
+                    else:
+                        job.update(status='failed', phase=None, error=str(exc)[:700])
                     self.save()
             finally:
                 finished.set()
                 try:
                     self.remove_workspace(job_id, run_id)
+                    with self.condition:
+                        current = self.jobs.get(job_id)
+                        if current and current.get('cleanup_run_id') == run_id:
+                            current.pop('cleanup_run_id', None)
+                            self.save()
                 except OSError as exc:
                     print('Workspace cleanup failed:', exc, flush=True)
 
@@ -515,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/jobs':
                 if not isinstance(payload.get('url'), str):
                     raise ValueError('Передайте URL записи.')
-                job_id = self.server.jobs.submit(payload['url'], payload.get('settings', {}))
+                job_id = self.server.jobs.submit(payload['url'], payload.get('settings', {}), payload.get('replace_confirmed', False))
             elif self.path == '/settings':
                 self.respond_json(200, self.server.jobs.set_settings(payload))
                 return
@@ -526,6 +656,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 job_id, action = match.groups()
                 self.server.jobs.action(job_id, action)
+        except ConfirmationRequired as exc:
+            self.respond_json(409, {'error': str(exc), 'requires_confirmation': True})
+            return
         except KeyError:
             self.respond_json(404, {'error': 'Задание не найдено.'})
             return
