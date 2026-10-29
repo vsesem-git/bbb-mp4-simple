@@ -26,16 +26,20 @@ cat > "$tmp/bin/systemctl" <<'MOCK'
 printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 MOCK
 chmod +x "$tmp/bin/sudo" "$tmp/bin/install" "$tmp/bin/systemctl"
-export UNIT_COPY="$tmp/unit" SYSTEMCTL_LOG="$tmp/systemctl-log"
+export UNIT_COPY="$tmp/bbb-mp4-web.service" SYSTEMCTL_LOG="$tmp/systemctl-log"
 export PATH="$tmp/bin:$PATH" HOME="$tmp/home" DOCKER_ARGS="$tmp/docker-args"
 repo="$tmp/repo with spaces"
 
 bash "$repo/deploy.sh"
 [[ -d "$repo/recordings" && -x "$repo/convert.sh" ]]
-grep -F 'WorkingDirectory="'"$repo"'"' "$UNIT_COPY" >/dev/null
+grep -Fx "WorkingDirectory=$repo" "$UNIT_COPY" >/dev/null
 grep -F 'ExecStart=/usr/bin/python3 "'"$repo"'/web.py"' "$UNIT_COPY" >/dev/null
 grep -Fx 'enable bbb-mp4-web.service' "$SYSTEMCTL_LOG" >/dev/null
 grep -Fx 'restart bbb-mp4-web.service' "$SYSTEMCTL_LOG" >/dev/null
+# Parse the actual generated unit too; mocked systemctl alone misses syntax errors.
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "$UNIT_COPY"
+fi
 python3 - "$DOCKER_ARGS" <<'PY'
 import sys
 assert open(sys.argv[1], 'rb').read().split(b'\0') == [b'pull', b'manishkatyan/bbb-mp4', b'']

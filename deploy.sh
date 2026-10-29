@@ -48,7 +48,9 @@ systemd_escape() {
 }
 unit_file=$(mktemp)
 trap 'rm -f -- "$unit_file"' EXIT
-escaped_dir=$(systemd_escape "$repo_dir")
+# WorkingDirectory is a literal path, not an ExecStart-style quoted argument.
+# Only systemd specifiers require escaping here.
+working_dir=${repo_dir//%/%%}
 escaped_script=$(systemd_escape "$repo_dir/web.py")
 cat > "$unit_file" <<EOF
 [Unit]
@@ -59,7 +61,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(id -un)
-WorkingDirectory="$escaped_dir"
+WorkingDirectory=$working_dir
 ExecStart=/usr/bin/python3 "$escaped_script"
 Restart=on-failure
 RestartSec=5
