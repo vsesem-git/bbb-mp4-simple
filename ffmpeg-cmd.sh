@@ -20,7 +20,7 @@ else
 fi
 
 ffmpeg -y -nostats -progress /usr/src/app/processed/.ffmpeg-progress -draw_mouse 0 -s 1280x800 \
-    -framerate 30 -f x11grab -thread_queue_size 1024 -i ":$DISPLAY_NUMBER" \
+    -framerate "${BBB_MP4_FPS:-30}" -f x11grab -thread_queue_size 1024 -i ":$DISPLAY_NUMBER" \
     -f alsa -thread_queue_size 1024 -itsoffset 0.57 -i pulse -ac 2 \
     -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1" \
     "$@" \

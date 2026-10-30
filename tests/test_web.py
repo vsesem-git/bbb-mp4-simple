@@ -237,17 +237,23 @@ else: sys.exit(1)
         self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
 
     def test_settings_snapshot_and_actual_container_arguments(self):
-        global_settings = {'resolution':'1280x720', 'video_bitrate':3333, 'audio_bitrate':192, 'preset':'slow', 'codec':'h265'}
+        global_settings = {'resolution':'1920x1080', 'video_bitrate':3333, 'audio_bitrate':192, 'preset':'slow', 'codec':'h265', 'fps':50}
         self.assertEqual(self.json_request('/settings', global_settings)[0], 200)
         self.assertEqual(self.json_request('/settings', {**global_settings, 'video_bitrate':0})[0], 400)
         self.assertEqual(self.json_request('/settings')[1], global_settings)
+        old_client = {k:v for k,v in global_settings.items() if k != 'fps'}
+        self.assertEqual(self.json_request('/settings', old_client)[1]['fps'], 50)
+        self.assertEqual(self.json_request('/settings', {**global_settings, 'resolution':'1280x720'})[0], 400)
         self.assertEqual(self.submit(URL, {'preset':'invalid'})[0], 400)
-        code, created = self.submit(URL, {'video_bitrate':'4000'})
+        self.assertEqual(self.submit(URL, {'resolution':'1280x720'})[0], 400)
+        self.assertEqual(self.submit(URL, {'fps':61})[0], 400)
+        self.assertEqual(self.submit(URL, {'fps':True})[0], 400)
+        code, created = self.submit(URL, {'video_bitrate':'4000', 'fps':25})
         self.assertEqual(code, 202)
         job_id = created['id']
-        expected = {**global_settings, 'video_bitrate':4000}
+        expected = {**global_settings, 'video_bitrate':4000, 'fps':25}
         self.assertEqual(self.json_request('/jobs/' + job_id)[1]['settings'], expected)
-        new_global = {**global_settings, 'video_bitrate':9000, 'resolution':'640x360'}
+        new_global = {**global_settings, 'video_bitrate':9000, 'resolution':'3440x1440', 'fps':60}
         self.assertEqual(self.json_request('/settings', new_global)[0], 200)
         job = self.await_state(job_id, {'done'})
         self.assertEqual(job['settings'], expected)
@@ -259,7 +265,7 @@ else: sys.exit(1)
         self.assertIn('0:v:0', inspections[1])
         self.assertIn('0:a:0', inspections[1])
         args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
-        for arg in ('BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow','BBB_MP4_CODEC=h265'):
+        for arg in ('BBB_MP4_SIZE=1920x1080','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow','BBB_MP4_CODEC=h265','BBB_MP4_FPS=25'):
             self.assertIn(arg, args)
         self.assertTrue(any(x.endswith('/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro') for x in args))
         self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 202)
@@ -342,12 +348,67 @@ else: sys.exit(1)
     def test_legacy_settings_and_metadata(self):
         state = web.ROOT / 'legacy'
         state.mkdir()
-        legacy = {'resolution':'1280x800', 'video_bitrate':2500, 'audio_bitrate':128, 'preset':'fast'}
+        legacy = {'resolution':'1280x720', 'video_bitrate':2500, 'audio_bitrate':128, 'preset':'fast'}
         (state / 'settings.json').write_text(json.dumps(legacy))
         jobs = web.Jobs(self.output, state)
-        self.assertEqual(jobs.get_settings(), {**legacy, 'codec':'h264'})
+        self.assertEqual(jobs.get_settings(), {**legacy, 'codec':'h264', 'fps':30})
+        # Existing global resolution can be retained, but not newly selected.
+        self.assertEqual(jobs.set_settings({**legacy, 'codec':'h264', 'fps':60})['resolution'], '1280x720')
+        self.assertEqual(jobs.set_settings({**legacy, 'codec':'h264'})['fps'], 60)
+        with self.assertRaises(ValueError):
+            jobs.set_settings({**legacy, 'codec':'h264', 'resolution':'640x360'})
+        job_id = jobs.submit(URL)
+        self.assertEqual(jobs.get(job_id)['settings']['fps'], 60)
+        self.assertEqual(jobs.get(job_id)['settings']['resolution'], '1280x720')
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and jobs.get(job_id)['status'] != 'done':
+            time.sleep(.05)
+        self.assertEqual(jobs.get(job_id)['status'], 'done')
+        args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
+        self.assertIn('BBB_MP4_SIZE=1280x720', args)
+        self.assertIn('BBB_MP4_FPS=60', args)
+        jobs.set_settings({**legacy, 'codec':'h264', 'resolution':'1280x800', 'fps':15})
+        jobs.action(job_id, 'recreate')
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and jobs.get(job_id)['status'] != 'done':
+            time.sleep(.05)
+        self.assertEqual(jobs.get(job_id)['status'], 'done')
+        self.assertEqual(jobs.get(job_id)['settings']['resolution'], '1280x720')
+        self.assertEqual(jobs.get(job_id)['settings']['fps'], 60)
         self.assertEqual(web.DEFAULT_SETTINGS['codec'], 'h264')
         self.assertIsNone(web.DEFAULT_SETTINGS['video_bitrate'])
+
+    def test_old_job_snapshot_retains_resolution_and_30fps_after_update(self):
+        state = web.ROOT / 'legacy-job'
+        state.mkdir()
+        job_id = '1'*32
+        legacy_settings = {'resolution':'640x360', 'video_bitrate':2500,
+                           'audio_bitrate':128, 'preset':'fast', 'codec':'h264'}
+        (state / 'jobs.json').write_text(json.dumps([{
+            'id':job_id, 'meeting_id':MEETING_ID, 'url':URL, 'status':'stopped',
+            'created':time.time(), 'run_id':None, 'settings':legacy_settings}]))
+        jobs = web.Jobs(self.output, state)
+        self.assertEqual(jobs.get(job_id)['settings'], {**legacy_settings, 'fps':30})
+        jobs.set_settings({**web.DEFAULT_SETTINGS, 'fps':60, 'resolution':'3440x1440'})
+        jobs.action(job_id, 'recreate')
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and jobs.get(job_id)['status'] != 'done':
+            time.sleep(.05)
+        self.assertEqual(jobs.get(job_id)['status'], 'done')
+        args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
+        self.assertIn('BBB_MP4_SIZE=640x360', args)
+        self.assertIn('BBB_MP4_FPS=30', args)
+        self.assertEqual(jobs.get(job_id)['settings']['fps'], 30)
+
+    def test_supported_resolution_and_frame_rate_values(self):
+        for size in ('1280x800','1920x1080','2560x1440','2560x1080','3440x1440'):
+            self.assertEqual(web.validate_settings({'resolution':size})['resolution'], size)
+        for fps in (15,24,25,30,50,60):
+            self.assertEqual(web.validate_settings({'fps':str(fps)})['fps'], fps)
+        for low in ('640x360','854x480','1280x720'):
+            with self.assertRaises(ValueError): web.validate_settings({'resolution':low})
+        for fps in (True, 0, 29, 61, '1.5'):
+            with self.assertRaises(ValueError): web.validate_settings({'fps':fps})
 
     def test_low_space_is_reported_and_recorded(self):
         old = web.LOW_SPACE_BYTES

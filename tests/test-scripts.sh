@@ -66,7 +66,7 @@ import sys
 args = [a.decode() for a in open(sys.argv[1], 'rb').read().split(b'\0')[:-1]]
 assert '--name' in args and 'bbb-mp4-11111111111111111111111111111111' in args
 assert sys.argv[2] + '/ffmpeg-cmd.sh:/usr/src/app/ffmpeg-cmd.sh:ro' in args
-assert all(x in args for x in ['BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow'])
+assert all(x in args for x in ['BBB_MP4_SIZE=1280x720','BBB_MP4_VIDEO_BITRATE=4000','BBB_MP4_AUDIO_BITRATE=192','BBB_MP4_PRESET=slow','BBB_MP4_FPS=30'])
 PYARGS
 BBB_MP4_SIZE=1280x800 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium BBB_MP4_CODEC=h265 bash "$repo/convert.sh" "$url"
 python3 - "$DOCKER_ARGS" <<'PYARGS'
@@ -74,7 +74,15 @@ import sys
 args = [a.decode() for a in open(sys.argv[1], 'rb').read().split(b'\0')[:-1]]
 assert 'BBB_MP4_VIDEO_BITRATE=auto' in args and 'BBB_MP4_CODEC=h265' in args
 PYARGS
+BBB_MP4_SIZE=3440x1440 BBB_MP4_FPS=60 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium bash "$repo/convert.sh" "$url"
+python3 - "$DOCKER_ARGS" <<'PYARGS'
+import sys
+args = [a.decode() for a in open(sys.argv[1], 'rb').read().split(b'\0')[:-1]]
+assert 'BBB_MP4_SIZE=3440x1440' in args and 'BBB_MP4_FPS=60' in args
+PYARGS
 rm "$DOCKER_ARGS"
+if BBB_MP4_SIZE=1280x800 BBB_MP4_FPS=99 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium bash "$repo/convert.sh" "$url"; then echo 'Invalid FPS accepted' >&2; exit 1; fi
+[[ ! -e $DOCKER_ARGS ]]
 if BBB_MP4_SIZE=1280x720 BBB_MP4_VIDEO_BITRATE=auto BBB_MP4_AUDIO_BITRATE=128 BBB_MP4_PRESET=medium BBB_MP4_CODEC=unsafe bash "$repo/convert.sh" "$url"; then echo 'Invalid codec accepted' >&2; exit 1; fi
 [[ ! -e $DOCKER_ARGS ]]
 if BBB_MP4_SIZE=1280x720 BBB_MP4_VIDEO_BITRATE=0 BBB_MP4_AUDIO_BITRATE=192 BBB_MP4_PRESET=slow bash "$repo/convert.sh" "$url"; then echo 'Invalid bitrate accepted' >&2; exit 1; fi

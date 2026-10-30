@@ -24,9 +24,11 @@ JOB_RE = re.compile(r'^[a-f0-9]{32}$')
 TRUSTED_NETWORKS = tuple(ipaddress.ip_network(net) for net in
                          ('127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
 ACTIVE = {'queued', 'running', 'stopping'}
-RESOLUTIONS = {'640x360', '854x480', '1280x720', '1280x800', '1920x1080'}
+RESOLUTIONS = {'1280x800', '1920x1080', '2560x1440', '2560x1080', '3440x1440'}
+LEGACY_RESOLUTIONS = {'640x360', '854x480', '1280x720'}
+FRAME_RATES = {15, 24, 25, 30, 50, 60}
 PRESETS = {'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'}
-DEFAULT_SETTINGS = {'resolution': '1280x800', 'video_bitrate': None, 'audio_bitrate': 128, 'preset': 'medium', 'codec': 'h264'}
+DEFAULT_SETTINGS = {'resolution': '1280x800', 'video_bitrate': None, 'audio_bitrate': 128, 'preset': 'medium', 'codec': 'h264', 'fps': 30}
 MAX_ATTEMPTS = 3
 RETRY_DELAY = 5
 LOW_SPACE_BYTES = 1024 ** 3
@@ -38,7 +40,7 @@ MAX_RESTARTS = 2
 LOG_LIMIT = 16000
 
 
-def validate_settings(values, base=None):
+def validate_settings(values, base=None, allow_legacy=False):
     if not isinstance(values, dict) or set(values) - set(DEFAULT_SETTINGS):
         raise ValueError('Неизвестные параметры конвертации.')
     result = dict(DEFAULT_SETTINGS if base is None else base)
@@ -52,8 +54,17 @@ def validate_settings(values, base=None):
             minimum, maximum = (250, 50000) if key == 'video_bitrate' else (32, 512)
             if not minimum <= value <= maximum:
                 raise ValueError(f'Битрейт {key} должен быть от {minimum} до {maximum} кбит/с.')
-        elif not isinstance(value, str) or value not in (RESOLUTIONS if key == 'resolution' else {'h264', 'h265'} if key == 'codec' else PRESETS):
-            raise ValueError('Недопустимое разрешение, кодек или пресет кодирования.')
+        elif key == 'fps':
+            if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isascii() or not str(value).isdigit():
+                raise ValueError('Недопустимая частота кадров.')
+            value = int(value)
+            if value not in FRAME_RATES:
+                raise ValueError('Недопустимая частота кадров.')
+        elif key == 'resolution':
+            if not isinstance(value, str) or value not in (RESOLUTIONS | LEGACY_RESOLUTIONS if allow_legacy else RESOLUTIONS):
+                raise ValueError('Недопустимое разрешение.')
+        elif not isinstance(value, str) or value not in ({'h264', 'h265'} if key == 'codec' else PRESETS):
+            raise ValueError('Недопустимый кодек или пресет кодирования.')
         result[key] = value
     return result
 
@@ -209,7 +220,7 @@ class Jobs:
         os.chmod(self.state_dir, 0o700)
         self.state_file = self.state_dir / 'jobs.json'
         self.settings_file = self.state_dir / 'settings.json'
-        self.settings = validate_settings(json.loads(self.settings_file.read_text(encoding='utf-8'))) if self.settings_file.exists() else dict(DEFAULT_SETTINGS)
+        self.settings = validate_settings(json.loads(self.settings_file.read_text(encoding='utf-8')), allow_legacy=True) if self.settings_file.exists() else dict(DEFAULT_SETTINGS)
         self.condition = threading.Condition()
         self.screenshot_interval = screenshot_interval
         self.retry_interval = retry_interval
@@ -229,7 +240,7 @@ class Jobs:
                         raise ValueError('Некорректный идентификатор запуска')
                 # Older jobs retain the original image's encoding settings.
                 if job.get('settings') is not None:
-                    job['settings'] = validate_settings(job['settings'])
+                    job['settings'] = validate_settings(job['settings'], allow_legacy=True)
                 self.jobs[job['id']] = job
         # Finish a deletion that was durably requested before a crash.
         for job_id, job in list(self.jobs.items()):
@@ -297,9 +308,12 @@ class Jobs:
 
     def set_settings(self, values):
         with self.condition:
-            if not isinstance(values, dict) or set(values) != set(DEFAULT_SETTINGS):
+            # Older clients omit FPS; keep its current value, never reset it.
+            if not isinstance(values, dict) or not (set(DEFAULT_SETTINGS) - {'fps'}) <= set(values) or set(values) - set(DEFAULT_SETTINGS):
                 raise ValueError('Передайте все глобальные параметры.')
-            result = validate_settings(values)
+            # A previously saved low resolution remains usable but cannot be newly selected.
+            allow_legacy = values.get('resolution') == self.settings['resolution']
+            result = validate_settings(values, self.settings, allow_legacy=allow_legacy)
             write_json(self.settings_file, result)
             self.settings = result
             return dict(result)
@@ -783,9 +797,9 @@ class Jobs:
                                BBB_MP4_VIDEO_BITRATE='auto' if settings['video_bitrate'] is None else str(settings['video_bitrate']),
                                BBB_MP4_CODEC=settings['codec'],
                                BBB_MP4_AUDIO_BITRATE=str(settings['audio_bitrate']),
-                               BBB_MP4_PRESET=settings['preset'])
+                               BBB_MP4_PRESET=settings['preset'], BBB_MP4_FPS=str(settings['fps']))
                 else:
-                    for key in ('BBB_MP4_SIZE', 'BBB_MP4_VIDEO_BITRATE', 'BBB_MP4_AUDIO_BITRATE', 'BBB_MP4_PRESET', 'BBB_MP4_CODEC'):
+                    for key in ('BBB_MP4_SIZE', 'BBB_MP4_VIDEO_BITRATE', 'BBB_MP4_AUDIO_BITRATE', 'BBB_MP4_PRESET', 'BBB_MP4_CODEC', 'BBB_MP4_FPS'):
                         env.pop(key, None)
                 process = subprocess.Popen([str(ROOT / 'convert.sh'), url], cwd=ROOT, env=env,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

@@ -56,13 +56,14 @@ if [[ -n ${BBB_MP4_DURATION:-} ]]; then
 fi
 # Web jobs pass a validated snapshot; plain CLI calls retain upstream defaults.
 if [[ -n ${BBB_MP4_SIZE:-} ]]; then
-    if [[ ! $BBB_MP4_SIZE =~ ^(640x360|854x480|1280x720|1280x800|1920x1080)$ ]] ||
+    if [[ ! $BBB_MP4_SIZE =~ ^(640x360|854x480|1280x720|1280x800|1920x1080|2560x1440|2560x1080|3440x1440)$ ]] ||
        [[ ! ${BBB_MP4_VIDEO_BITRATE:-} =~ ^(auto|[0-9]{1,5})$ ]] ||
        [[ ! ${BBB_MP4_AUDIO_BITRATE:-} =~ ^[0-9]{1,3}$ ]] ||
        { [[ $BBB_MP4_VIDEO_BITRATE != auto ]] && (( 10#$BBB_MP4_VIDEO_BITRATE < 250 || 10#$BBB_MP4_VIDEO_BITRATE > 50000 )); } ||
        (( 10#$BBB_MP4_AUDIO_BITRATE < 32 || 10#$BBB_MP4_AUDIO_BITRATE > 512 )) ||
        [[ ! ${BBB_MP4_CODEC:-h264} =~ ^(h264|h265)$ ]] ||
        [[ ! ${BBB_MP4_PRESET:-} =~ ^(ultrafast|superfast|veryfast|faster|fast|medium|slow)$ ]] ||
+       [[ ! ${BBB_MP4_FPS:-30} =~ ^(15|24|25|30|50|60)$ ]] ||
        [[ $script_dir == *:* || ! -f $script_dir/ffmpeg-cmd.sh ]]; then
         echo 'Неверные параметры кодирования или путь к скрипту.' >&2
         exit 1
@@ -72,7 +73,8 @@ if [[ -n ${BBB_MP4_SIZE:-} ]]; then
         --env "BBB_MP4_VIDEO_BITRATE=$BBB_MP4_VIDEO_BITRATE"
         --env "BBB_MP4_AUDIO_BITRATE=$BBB_MP4_AUDIO_BITRATE"
         --env "BBB_MP4_PRESET=$BBB_MP4_PRESET"
-        --env "BBB_MP4_CODEC=${BBB_MP4_CODEC:-h264}")
+        --env "BBB_MP4_CODEC=${BBB_MP4_CODEC:-h264}"
+        --env "BBB_MP4_FPS=${BBB_MP4_FPS:-30}")
 fi
 image=manishkatyan/bbb-mp4
 if [[ -f $script_dir/state/image.ref ]]; then
