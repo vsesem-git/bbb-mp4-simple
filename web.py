@@ -34,9 +34,11 @@ MAX_PARALLEL_JOBS = 3
 RETRY_DELAY = 5
 LOW_SPACE_BYTES = 1024 ** 3
 PREPARE_TIMEOUT = int(os.environ.get('BBB_MP4_PREPARE_TIMEOUT', '600'))
-STALL_TIMEOUT = int(os.environ.get('BBB_MP4_STALL_TIMEOUT', '600'))
+STALL_TIMEOUT = int(os.environ.get('BBB_MP4_STALL_TIMEOUT', '120'))
 CAPTURE_TIMEOUT_FACTOR = float(os.environ.get('BBB_MP4_CAPTURE_TIMEOUT_FACTOR', '2'))
-CAPTURE_TIMEOUT_GRACE = int(os.environ.get('BBB_MP4_CAPTURE_TIMEOUT_GRACE', '1800'))
+CAPTURE_TIMEOUT_GRACE = int(os.environ.get('BBB_MP4_CAPTURE_TIMEOUT_GRACE', '120'))
+MAX_CAPTURE_LAG = 30
+CAPTURE_LAG_WARMUP = 60
 MAX_RESTARTS = 2
 LOG_LIMIT = 16000
 
@@ -104,10 +106,15 @@ def write_json(path, data):
     finally:
         os.close(directory_fd)
 # Capture the existing Xvfb display, without modifying the original image.
-CAPTURE = r'''for x in /tmp/.X11-unix/X[0-9]*; do
+CAPTURE = r'''size=${BBB_MP4_SIZE:-1280x800}
+case "$size" in
+  640x360|854x480|1280x720|1280x800|1920x1080|2560x1440|2560x1080|3440x1440) ;;
+  *) exit 1 ;;
+esac
+for x in /tmp/.X11-unix/X[0-9]*; do
   [ -S "$x" ] || continue
   display=${x##*X}
-  exec ffmpeg -v error -f x11grab -video_size 1280x800 -i ":$display" -frames:v 1 -f image2pipe -vcodec mjpeg pipe:1
+  exec ffmpeg -v error -f x11grab -video_size "$size" -i ":$display" -frames:v 1 -f image2pipe -vcodec mjpeg pipe:1
 done
 exit 1'''
 
@@ -138,6 +145,42 @@ def signature(path):
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
     except FileNotFoundError:
         return None
+
+
+def ffmpeg_progress(path):
+    """Last complete FFmpeg progress block; incomplete writes are ignored.
+
+    FFmpeg 4.3 reports out_time_ms in microseconds as well as out_time_us.
+    The frame count is video-specific; out_time can instead reflect audio.
+    """
+    try:
+        with path.open('rb') as f:
+            f.seek(0, os.SEEK_END)
+            length = f.tell()
+            f.seek(max(0, length - 65536))
+            data = f.read()
+    except (OSError, ValueError):
+        return None
+    # Only newline-terminated blocks are guaranteed to be completely written.
+    lines = data[:data.rfind(b'\n') + 1].splitlines()
+    end = next((i for i in range(len(lines)-1, -1, -1)
+                if lines[i] in (b'progress=continue', b'progress=end')), None)
+    if end is None:
+        return None
+    start = next((i + 1 for i in range(end-1, -1, -1)
+                  if lines[i] in (b'progress=continue', b'progress=end')), 0)
+    values = {}
+    for line in lines[start:end]:
+        key, sep, value = line.partition(b'=')
+        if sep:
+            values[key.strip()] = value.strip()
+    frame = values.get(b'frame', b'')
+    if not frame.isdigit():
+        return None
+    raw_time = values.get(b'out_time_us', values.get(b'out_time_ms', b''))
+    micros = int(raw_time) if raw_time.lstrip(b'-').isdigit() else None
+    speed = values.get(b'speed', b'N/A').decode('ascii', errors='replace')[:32]
+    return {'frame': int(frame), 'time_us': micros, 'speed': speed}
 
 
 def mp4_duration(path):
@@ -233,6 +276,7 @@ class Jobs:
         self.forced_workers = set()
         self.maintenance = False
         self.file_metadata = {}
+        self.capture_progress = {}
         if self.state_file.exists():
             # Fail closed on corrupt state, rather than lose jobs or overwrite files.
             data = json.loads(self.state_file.read_text(encoding='utf-8'))
@@ -325,6 +369,8 @@ class Jobs:
                                     self.recover([job])
                                 self.save_worker()
                                 self.worker_owners.pop(key, None)
+                                if owner:
+                                    self.capture_progress.pop(owner, None)
                                 self.set_worker_error(key, None)
                             break
                         except Exception as recovery_error:
@@ -483,8 +529,17 @@ class Jobs:
             item['progress'] = 99
         elif job['status'] in ('running', 'stopping') and job.get('duration') and job.get('capture_started'):
             elapsed = max(0, time.time() - job['capture_started'])
-            item['progress'] = min(99, max(0, round(100 * elapsed / job['duration'])))
-            item['remaining'] = max(0, math.ceil(job['duration'] - elapsed))
+            if job.get('settings') is not None:
+                sample = self.capture_progress.get(job['id'])
+                # Actual output frames are more honest than wall-clock time.
+                processed = sample['frame'] / job['settings']['fps'] if sample else None
+            else:
+                # Legacy jobs use the original script without a progress file.
+                processed = elapsed
+            if processed is not None:
+                item['progress'] = min(99, max(0, round(100 * processed / job['duration'])))
+                if processed > 0 and processed < job['duration']:
+                    item['remaining'] = max(0, math.ceil((job['duration'] - processed) * elapsed / processed))
         return item
 
     def list(self):
@@ -844,6 +899,7 @@ class Jobs:
                         self.save_worker()
                         continue
                 self.worker_owners[key] = job['id']
+                self.capture_progress.pop(job['id'], None)
                 job['status'] = 'running'
                 job['attempt'] = job.get('attempt', 0) + 1
                 job['error'] = None
@@ -918,10 +974,13 @@ class Jobs:
                 stop_succeeded = False
                 started_at = time.time()
                 timed_out = False
-                last_progress = None
+                last_frame = None
+                last_progress_log = time.monotonic()
                 last_activity = time.monotonic()
                 capture_seen = False
+                capture_monotonic = None
                 timeout_reason = 'Превышено допустимое время конвертации'
+                retry_timeout = True
                 stop_requested_at = None
                 while process.poll() is None:
                     with self.condition:
@@ -930,18 +989,38 @@ class Jobs:
                         capture_started = job.get('capture_started')
                         phase = job.get('phase')
                     if capture_started and not capture_seen:
-                        last_activity = time.monotonic()
+                        capture_monotonic = time.monotonic()
+                        last_activity = capture_monotonic
                         capture_seen = True
-                    progress_signature = signature(workspace / '.ffmpeg-progress') if settings is not None else None
-                    if progress_signature != last_progress:
-                        last_progress = progress_signature
-                        last_activity = time.monotonic()
+                    sample = ffmpeg_progress(workspace / '.ffmpeg-progress') if settings is not None else None
+                    if sample is not None:
+                        frame = sample['frame']
+                        if last_frame is None or frame > last_frame:
+                            last_frame = frame
+                            last_activity = time.monotonic()
+                        with self.condition:
+                            self.capture_progress[job_id] = sample
+                            if time.monotonic() - last_progress_log >= 30:
+                                self.log(job, f"FFmpeg: кадров {frame}, видео ~{frame / settings['fps']:.1f} с, скорость {sample['speed']}.\n")
+                                last_progress_log = time.monotonic()
                     stalled = bool(settings is not None and capture_started and phase == 'capturing'
                                    and time.monotonic() - last_activity > STALL_TIMEOUT)
                     elapsed = time.time() - (capture_started or started_at)
-                    limit = max(duration * CAPTURE_TIMEOUT_FACTOR + CAPTURE_TIMEOUT_GRACE, duration + 600) if duration and capture_started else PREPARE_TIMEOUT
-                    timed_out = not stopping and (elapsed > limit or stalled)
-                    if stalled:
+                    # Once all frames have entered the encoder it may still
+                    # need time to flush, so do not call that a capture lag.
+                    processed = sample['frame'] / settings['fps'] if sample and settings else None
+                    capture_elapsed = time.monotonic() - capture_monotonic if capture_monotonic is not None else 0
+                    overloaded = bool(settings is not None and capture_started and phase == 'capturing'
+                                      and duration and processed is not None
+                                      and processed < duration - 2
+                                      and capture_elapsed > CAPTURE_LAG_WARMUP and capture_elapsed - processed > MAX_CAPTURE_LAG)
+                    limit = max(duration * CAPTURE_TIMEOUT_FACTOR + CAPTURE_TIMEOUT_GRACE, duration + 120) if duration and capture_started else PREPARE_TIMEOUT
+                    timed_out = not stopping and (elapsed > limit or stalled or overloaded)
+                    if overloaded:
+                        timeout_reason = ('Кодирование не успевает за записью. Уменьшите разрешение или FPS, '
+                                          'выберите H.264 и более быстрый пресет либо сократите число параллельных заданий')
+                        retry_timeout = False
+                    elif stalled:
                         timeout_reason = 'Нет прогресса FFmpeg в течение допустимого времени'
                     if stopping and stop_requested_at is None:
                         stop_requested_at = time.monotonic()
@@ -974,7 +1053,7 @@ class Jobs:
                 reader.join(timeout=15)
                 process.stdout.close()
                 if timed_out:
-                    raise ConversionError(timeout_reason + '; контейнер остановлен.', retryable=True)
+                    raise ConversionError(timeout_reason + '; контейнер остановлен.', retryable=retry_timeout)
                 # A failed Docker client is not proof that its container exited.
                 if process.returncode != 0:
                     remove_container('bbb-mp4-' + job_id)
@@ -1039,7 +1118,9 @@ class Jobs:
                     self.log(job, '\nОшибка: ' + str(exc) + '\n')
                     retry = (job['status'] != 'stopping' and isinstance(exc, ConversionError)
                              and exc.retryable and job.get('attempt', 0) < MAX_ATTEMPTS)
-                    if retry:
+                    if job['status'] == 'stopping':
+                        job.update(status='stopped', phase=None, error=None)
+                    elif retry:
                         delay = RETRY_DELAY * (2 ** (job['attempt'] - 1))
                         job.update(status='queued', phase=None, error='Повтор после ошибки: ' + str(exc)[:600],
                                    next_attempt=time.time() + delay, queued_at=time.time_ns(),
@@ -1070,6 +1151,7 @@ class Jobs:
                 if not orphaned:
                     with self.condition:
                         self.worker_owners.pop(key, None)
+                        self.capture_progress.pop(job_id, None)
                         self.condition.notify_all()
 
 

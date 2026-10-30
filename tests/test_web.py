@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
+import subprocess
 import shutil
 import tempfile
 import threading
@@ -19,6 +21,41 @@ spec.loader.exec_module(web)
 MEETING_ID = 'f678f4a23ecaf2ac77135e744f2c9da8764c32dd-1793270594439'
 URL = 'https://vks.vsesem.ru/playback/presentation/2.3/' + MEETING_ID
 
+
+class ProgressParserTest(unittest.TestCase):
+    def test_complete_frame_block_and_partial_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'progress'
+            self.assertIsNone(web.ffmpeg_progress(path))
+            path.write_bytes(b'frame=10\nout_time_ms=2000000\nspeed=0.5x\nprogress=continue\nframe=20\nout_time_us=')
+            result = web.ffmpeg_progress(path)
+            self.assertEqual(result, {'frame':10, 'time_us':2000000, 'speed':'0.5x'})
+            with path.open('ab') as f:
+                f.write(b'3000000\nspeed=0.75x\nprogress=end\n')
+            self.assertEqual(web.ffmpeg_progress(path), {'frame':20, 'time_us':3000000, 'speed':'0.75x'})
+            path.write_bytes(b'frame=NaN\nout_time_us=N/A\nprogress=continue\n')
+            self.assertIsNone(web.ffmpeg_progress(path))
+            path.write_bytes(b'x' * 70000 + b'\nprogress=continue\nframe=31\nout_time_us=N/A\nprogress=continue\n')
+            self.assertEqual(web.ffmpeg_progress(path)['frame'], 31)
+            self.assertIsNone(web.ffmpeg_progress(path)['time_us'])
+
+class ScreenshotCommandTest(unittest.TestCase):
+    def test_preview_captures_the_selected_screen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(sock.close)
+            sock.bind(str(root / 'X112'))
+            ffmpeg = root / 'ffmpeg'
+            ffmpeg.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+            ffmpeg.chmod(0o755)
+            command = web.CAPTURE.replace('/tmp/.X11-unix', str(root))
+            env = {**os.environ, 'PATH':str(root)+':'+os.environ['PATH'], 'BBB_MP4_SIZE':'2560x1440'}
+            result = subprocess.run(['sh', '-c', command], env=env, capture_output=True, text=True, check=True)
+            args = json.loads(result.stdout)
+            self.assertEqual(args[args.index('-video_size')+1], '2560x1440')
+            self.assertEqual(args[args.index('-i')+1], ':112')
+            self.assertNotIn('-vf', args)
 
 class WebTest(unittest.TestCase):
     def setUp(self):
@@ -90,13 +127,21 @@ elif args[0] == 'run':
         sys.exit(143)
     print('5.0', flush=True)
     print('stderr: Output #0, mp4, to output.mp4', flush=True)
-    if 'case=stallprogress' in url:
-        pathlib.Path(mount, '.ffmpeg-progress').write_text('out_time_ms=1')
-        while not (root / (name + '.stop')).exists(): time.sleep(.05)
+    progress = pathlib.Path(mount, '.ffmpeg-progress')
+    if 'case=stallprogress' in url or 'case=slowprogress' in url:
+        frame = 0
+        while not (root / (name + '.stop')).exists():
+            with progress.open('a') as f:
+                f.write('frame=%d\\nout_time_us=%d\\nspeed=0.1x\\nprogress=continue\\n' % (frame, frame * 33333))
+            if 'case=slowprogress' in url: frame += 1
+            time.sleep(.1)
         sys.exit(143)
-    for _ in range(20):
+    for n in range(20):
         if (root / (name + '.stop')).exists():
             (root / (name + '.running')).unlink(missing_ok=True); sys.exit(143)
+        with progress.open('a') as f:
+            frame = 150 if 'case=flushprogress' in url else n * 3
+            f.write('frame=%d\\nout_time_us=%d\\nspeed=1x\\nprogress=continue\\n' % (frame, n * 100000))
         time.sleep(.05)
     (root / (name + '.running')).unlink(missing_ok=True)
     count_file = root / (name + '.attempts')
@@ -323,15 +368,15 @@ else: sys.exit(1)
         self.await_state(normal, {'running'})
         other = 'b'*40 + '-1234567890123'
         forced = self.submit(URL.replace(MEETING_ID,other) + '?case=hang')[1]['id']
-        original = web.signature
+        original = web.ffmpeg_progress
         triggered = threading.Event()
-        def broken_signature(path):
+        def broken_progress(path):
             if ('.bbb-mp4-' + forced) in str(path) and (web.ROOT / ('bbb-mp4-' + forced + '.running')).exists() and not triggered.is_set():
                 triggered.set()
                 raise OSError('simulated unexpected read error')
             return original(path)
-        web.signature = broken_signature
-        self.addCleanup(setattr, web, 'signature', original)
+        web.ffmpeg_progress = broken_progress
+        self.addCleanup(setattr, web, 'ffmpeg_progress', original)
         self.assertEqual(self.json_request('/jobs/' + forced + '/force', {})[0], 202)
         self.await_state(forced, {'failed'})
         self.assertTrue(triggered.is_set())
@@ -716,6 +761,40 @@ else: sys.exit(1)
         job = self.await_state(job_id, {'failed'}, timeout=12)
         self.assertIn('Нет прогресса FFmpeg', job['error'])
         self.assertEqual(job['attempt'], 3)
+
+    def test_slow_ffmpeg_frames_fail_early_without_blind_retries(self):
+        warmup, lag = web.CAPTURE_LAG_WARMUP, web.MAX_CAPTURE_LAG
+        web.CAPTURE_LAG_WARMUP, web.MAX_CAPTURE_LAG = .8, .25
+        self.addCleanup(setattr, web, 'CAPTURE_LAG_WARMUP', warmup)
+        self.addCleanup(setattr, web, 'MAX_CAPTURE_LAG', lag)
+        job_id = self.submit(URL + '?case=slowprogress')[1]['id']
+        job = self.await_state(job_id, {'failed'}, timeout=8)
+        self.assertIn('Кодирование не успевает', job['error'])
+        self.assertEqual(job['attempt'], 1)
+        self.assertIn('rm -f bbb-mp4-' + job_id, (web.ROOT / 'calls').read_text())
+
+    def test_completed_frames_are_allowed_to_finish_encoding(self):
+        warmup, lag = web.CAPTURE_LAG_WARMUP, web.MAX_CAPTURE_LAG
+        web.CAPTURE_LAG_WARMUP, web.MAX_CAPTURE_LAG = .1, .1
+        self.addCleanup(setattr, web, 'CAPTURE_LAG_WARMUP', warmup)
+        self.addCleanup(setattr, web, 'MAX_CAPTURE_LAG', lag)
+        job_id = self.submit(URL + '?case=flushprogress')[1]['id']
+        job = self.await_state(job_id, {'done', 'failed'}, timeout=8)
+        self.assertEqual(job['status'], 'done', job.get('error'))
+
+    def test_progress_uses_frames_not_elapsed_time(self):
+        job_id = self.submit(URL + '?case=stallprogress')[1]['id']
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = self.server.jobs.get(job_id)
+            if job['progress'] is not None:
+                break
+            time.sleep(.05)
+        self.assertEqual(job['progress'], 0)
+        time.sleep(.6)
+        self.assertEqual(self.server.jobs.get(job_id)['progress'], 0)
+        self.server.jobs.action(job_id, 'stop')
+        self.await_state(job_id, {'stopped'})
 
     def test_queue_waits_if_container_removal_cannot_be_confirmed(self):
         old_timeout, original_remove = web.PREPARE_TIMEOUT, web.remove_container

@@ -12,10 +12,14 @@ URL = 'https://example.test/playback/presentation/2.3/' + 'a'*40 + '-12345678901
 
 @unittest.skipUnless(shutil.which('node'), 'Node is needed for the browser adapter test')
 class BrowserAdapterTest(unittest.TestCase):
-    def run_browser(self, mode, override=None):
+    def run_browser(self, mode, override=None, size=None):
         with tempfile.TemporaryDirectory() as directory:
             args_file = Path(directory) / 'args.json'
             env = {**os.environ, 'ARGS_FILE': str(args_file), 'MOCK_MODE': mode}
+            if size is None:
+                env.pop('BBB_MP4_SIZE', None)
+            else:
+                env['BBB_MP4_SIZE'] = size
             if override is None:
                 env.pop('BBB_MP4_DURATION', None)
             else:
@@ -30,6 +34,21 @@ class BrowserAdapterTest(unittest.TestCase):
         self.assertIn('\n11065\n', result.stdout)
         self.assertEqual(args['args'][:3], ['ffmpeg-cmd.sh', '11065', 'a'*40 + '-1234567890123'])
         self.assertNotIn('Xvfb stopped before FFmpeg', result.stderr)
+
+    def test_selected_size_reaches_xvfb_chrome_and_viewport(self):
+        for size in ('640x360','854x480','1280x720','1280x800','1920x1080','2560x1440','2560x1080','3440x1440'):
+            with self.subTest(size=size):
+                result, args = self.run_browser('metadata', size=size)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(size+'x24', args['xvfbOptions']['xvfb_args'])
+                self.assertIn('--window-size='+size.replace('x',','), args['chromeOptions']['args'])
+                self.assertTrue(args['clearMetrics'])
+                self.assertIn('Capture screen: '+size, result.stdout)
+        result, args = self.run_browser('metadata')
+        self.assertIn('1280x800x24', args['xvfbOptions']['xvfb_args'])
+        result, args = self.run_browser('metadata', size='999x999')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(args)
 
     def test_missing_duration_fails_without_starting_ffmpeg(self):
         result, args = self.run_browser('timeout')

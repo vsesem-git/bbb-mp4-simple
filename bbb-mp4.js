@@ -3,15 +3,19 @@ const puppeteer = require('puppeteer');
 const child_process = require('child_process');
 const Xvfb = require('xvfb');
 
-// Generate randome display port number to avoide xvfb failure
+// Legacy CLI jobs have no settings and retain the upstream 1280x800 display.
+// Validate again in the container, before using the value in Xvfb or Chrome.
+const supportedSizes = new Set(['640x360', '854x480', '1280x720', '1280x800',
+    '1920x1080', '2560x1440', '2560x1080', '3440x1440']);
+const captureSize = process.env.BBB_MP4_SIZE || '1280x800';
+if (!supportedSizes.has(captureSize)) throw new Error('Unsupported capture size');
+const [width, height] = captureSize.split('x').map(Number);
 var disp_num = Math.floor(Math.random() * (200 - 99) + 99);
 var xvfb = new Xvfb({
     displayNum: disp_num,
     silent: true,
-    xvfb_args: ["-screen", "0", "1280x800x24", "-ac", "-nolisten", "tcp", "-dpi", "96", "+extension", "RANDR"]
+    xvfb_args: ["-screen", "0", `${captureSize}x24`, "-ac", "-nolisten", "tcp", "-dpi", "96", "+extension", "RANDR"]
 });
-var width = 1280;
-var height = 800;
 var options = {
     headless: false,
     args: [
@@ -27,6 +31,7 @@ options.executablePath = "/usr/bin/google-chrome"
 async function main() {
     let browser, page;
     try {
+        console.log(`Capture screen: ${captureSize}`);
         xvfb.startSync()
 
         var url = process.argv[2];
