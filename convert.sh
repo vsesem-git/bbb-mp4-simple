@@ -43,6 +43,17 @@ if [[ -n ${BBB_MP4_CONTAINER_NAME:-} ]]; then
     fi
     container_args=(--name "$BBB_MP4_CONTAINER_NAME")
 fi
+# Fix upstream duration detection for both web and one-off CLI runs.
+if [[ $script_dir == *:* || ! -f $script_dir/bbb-mp4.js ]]; then
+    echo 'Не найден скрипт браузера или неверный путь.' >&2; exit 1
+fi
+container_args+=(-v "$script_dir/bbb-mp4.js:/usr/src/app/bbb-mp4.js:ro")
+if [[ -n ${BBB_MP4_DURATION:-} ]]; then
+    if [[ ! $BBB_MP4_DURATION =~ ^[0-9]{1,6}$ ]] || (( 10#$BBB_MP4_DURATION < 1 || 10#$BBB_MP4_DURATION > 604800 )); then
+        echo 'Длительность должна быть целым числом секунд от 1 до 604800.' >&2; exit 1
+    fi
+    container_args+=(--env "BBB_MP4_DURATION=$BBB_MP4_DURATION")
+fi
 # Web jobs pass a validated snapshot; plain CLI calls retain upstream defaults.
 if [[ -n ${BBB_MP4_SIZE:-} ]]; then
     if [[ ! $BBB_MP4_SIZE =~ ^(640x360|854x480|1280x720|1280x800|1920x1080)$ ]] ||
@@ -63,7 +74,14 @@ if [[ -n ${BBB_MP4_SIZE:-} ]]; then
         --env "BBB_MP4_PRESET=$BBB_MP4_PRESET"
         --env "BBB_MP4_CODEC=${BBB_MP4_CODEC:-h264}")
 fi
+image=manishkatyan/bbb-mp4
+if [[ -f $script_dir/state/image.ref ]]; then
+    IFS= read -r image < "$script_dir/state/image.ref" || true
+    if [[ ! $image =~ ^manishkatyan/bbb-mp4@sha256:[a-f0-9]{64}$ ]]; then
+        echo 'Некорректная закреплённая версия образа.' >&2; exit 1
+    fi
+fi
 docker run --rm "${container_args[@]}" \
     -v "$COPY_TO_LOCATION:/usr/src/app/processed" \
     --env "REC_URL=$url" \
-    manishkatyan/bbb-mp4
+    "$image"

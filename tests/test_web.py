@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -33,6 +34,7 @@ class WebTest(unittest.TestCase):
         shutil.copy(ROOT / 'web.html', root)
         shutil.copy(ROOT / 'convert.sh', root)
         shutil.copy(ROOT / 'ffmpeg-cmd.sh', root)
+        shutil.copy(ROOT / 'bbb-mp4.js', root)
         (root / '.env').write_text('COPY_TO_LOCATION=' + shlex.quote(str(root / 'results with spaces')) + '\n')
         self.output = web.output_directory()
         self.output.mkdir()
@@ -50,6 +52,7 @@ if args[0] == 'run' and '--entrypoint' in args:
     program = args[args.index('--entrypoint') + 1]
     if program == 'ffmpeg':
         if 'case=decodeerror' in url: print('corrupt video frame', file=sys.stderr); sys.exit(1)
+        if 'case=warnings' in url: print('black_duration:25.0 silence_duration:25.0', file=sys.stderr)
         sys.exit(0)
     if 'case=probeerror' in url:
         print('invalid mp4', file=sys.stderr); sys.exit(1)
@@ -81,8 +84,14 @@ elif args[0] == 'run':
     time.sleep(.2)
     (root / (name + '.stop')).unlink(missing_ok=True)
     (root / (name + '.running')).touch()
+    if 'case=hang' in url:
+        while not (root / (name + '.stop')).exists(): time.sleep(.05)
+        sys.exit(143)
     print('5.0', flush=True)
     print('stderr: Output #0, mp4, to output.mp4', flush=True)
+    if 'case=stallprogress' in url:
+        pathlib.Path(mount, '.ffmpeg-progress').write_text('out_time_ms=1')
+        while True: time.sleep(1)
     for _ in range(20):
         if (root / (name + '.stop')).exists():
             (root / (name + '.running')).unlink(missing_ok=True); sys.exit(143)
@@ -364,6 +373,149 @@ else: sys.exit(1)
         self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
         self.assertIn('stop --time 2 bbb-probe-' + job_id, (web.ROOT / 'calls').read_text())
 
+    def test_duration_override_and_diagnostic_warnings(self):
+        self.assertEqual(web.parse_duration('3:04:25'), 11065)
+        for invalid in ('-3:04:25', '3:99:25', 'nan', '-1', '604801'):
+            with self.assertRaises(ValueError):
+                web.parse_duration(invalid)
+        code, created = self.json_request('/jobs', {'url': URL + '?case=warnings', 'duration_override': '3:04:25'})
+        self.assertEqual(code, 202)
+        job_id = created['id']
+        job = self.await_state(job_id, {'done'})
+        self.assertEqual(job['duration_override'], 11065)
+        self.assertEqual(len(job['verification']['warnings']), 2)
+        args = json.loads((web.ROOT / ('bbb-mp4-' + job_id + '.args')).read_text())
+        self.assertIn('BBB_MP4_DURATION=11065', args)
+        code, _ = self.json_request('/jobs/' + job_id + '/recreate', {'duration_override': '1:02:03'})
+        self.assertEqual(code, 202)
+        job = self.await_state(job_id, {'done'})
+        self.assertEqual(job['duration_override'], 3723)
+
+    def test_failed_state_write_does_not_delete_existing_result(self):
+        job_id = self.submit(URL)[1]['id']
+        self.await_state(job_id, {'done'})
+        target = self.output / (MEETING_ID + '.mp4')
+        original = target.read_bytes()
+        with mock.patch.object(self.server.jobs, 'save', side_effect=OSError('disk full')):
+            self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 500)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(self.server.jobs.get(job_id)['status'], 'done')
+            self.assertEqual(self.json_request('/jobs/' + job_id + '/delete', {})[0], 500)
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_unfinished_delete_cannot_be_recreated(self):
+        job_id = self.submit(URL)[1]['id']
+        self.await_state(job_id, {'done'})
+        with mock.patch.object(self.server.jobs, 'remove_result', side_effect=OSError('permission denied')):
+            self.assertEqual(self.json_request('/jobs/' + job_id + '/delete', {})[0], 500)
+        self.assertIn('Удаление не завершено', self.server.jobs.get(job_id)['error'])
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/recreate', {})[0], 400)
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/delete', {})[0], 202)
+        self.assertFalse((self.output / (MEETING_ID + '.mp4')).exists())
+
+    def test_worker_survives_state_write_failure(self):
+        jobs = self.server.jobs
+        original = jobs.save
+        def fail():
+            raise OSError('simulated full disk')
+        # Keep the worker out until submit has durably queued the job.
+        with jobs.condition:
+            job_id = jobs.submit(URL)
+            jobs.save = fail
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not jobs.persistence_error:
+            time.sleep(.02)
+        self.assertIn('simulated full disk', jobs.persistence_error)
+        self.assertEqual(jobs.get(job_id)['status'], 'running')
+        self.assertFalse((web.ROOT / ('bbb-mp4-' + job_id + '.args')).exists())
+        jobs.save = original
+        with jobs.condition:
+            jobs.condition.notify_all()
+        self.assertEqual(self.await_state(job_id, {'done'})['status'], 'done')
+        self.assertIsNone(jobs.persistence_error)
+
+    def test_hung_start_is_stopped_and_retried(self):
+        old = web.PREPARE_TIMEOUT
+        web.PREPARE_TIMEOUT = .3
+        self.addCleanup(setattr, web, 'PREPARE_TIMEOUT', old)
+        job_id = self.submit(URL + '?case=hang')[1]['id']
+        job = self.await_state(job_id, {'failed'}, timeout=12)
+        self.assertIn('Превышено допустимое время', job['error'])
+        self.assertEqual(job['attempt'], 3)
+        calls = (web.ROOT / 'calls').read_text()
+        self.assertIn('rm -f bbb-mp4-' + job_id, calls)
+
+    def test_stalled_ffmpeg_progress_is_stopped_and_retried(self):
+        old = web.STALL_TIMEOUT
+        web.STALL_TIMEOUT = .3
+        self.addCleanup(setattr, web, 'STALL_TIMEOUT', old)
+        job_id = self.submit(URL + '?case=stallprogress')[1]['id']
+        job = self.await_state(job_id, {'failed'}, timeout=12)
+        self.assertIn('Нет прогресса FFmpeg', job['error'])
+        self.assertEqual(job['attempt'], 3)
+
+    def test_queue_waits_if_container_removal_cannot_be_confirmed(self):
+        old_timeout, original_remove = web.PREPARE_TIMEOUT, web.remove_container
+        web.PREPARE_TIMEOUT = .3
+        allowed = threading.Event()
+        def remove(name):
+            if not allowed.is_set():
+                raise web.OrphanContainerError('simulated Docker removal failure')
+            original_remove(name)
+        web.remove_container = remove
+        def cleanup():
+            allowed.set()
+            web.remove_container = original_remove
+            web.PREPARE_TIMEOUT = old_timeout
+        self.addCleanup(cleanup)
+        job_id = self.submit(URL + '?case=hang')[1]['id']
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.server.jobs.worker_error:
+            time.sleep(.05)
+        self.assertIsNotNone(self.server.jobs.worker_error)
+        other = 'd'*40 + '-1234567890123'
+        other_id = self.submit(URL.replace(MEETING_ID, other))[1]['id']
+        time.sleep(.3)
+        self.assertEqual(self.server.jobs.get(other_id)['status'], 'queued')
+        self.assertFalse((web.ROOT / ('bbb-mp4-' + other_id + '.args')).exists())
+        allowed.set()
+        # Recovery sleeps up to five seconds after a failed cleanup.
+        self.assertEqual(self.await_state(other_id, {'done'}, timeout=12)['status'], 'done')
+        self.server.jobs.action(job_id, 'stop')
+        self.await_state(job_id, {'stopped'})
+
+    def test_maintenance_prevents_restart_during_active_work(self):
+        self.assertEqual(self.json_request('/maintenance', {'enabled':True})[0], 200)
+        self.assertEqual(self.submit(URL)[0], 400)
+        self.assertEqual(self.json_request('/maintenance', {'enabled':False})[0], 200)
+        job_id = self.submit(URL)[1]['id']
+        self.await_state(job_id, {'running'})
+        self.assertEqual(self.json_request('/maintenance', {'enabled':True})[0], 400)
+        self.await_state(job_id, {'done'})
+        self.assertEqual(self.json_request('/maintenance', {'enabled':True})[0], 200)
+        self.assertTrue(self.json_request('/health')[1]['maintenance'])
+        self.json_request('/maintenance', {'enabled':False})
+
+    def test_recover_already_published_file_without_recapture(self):
+        state = web.ROOT / 'finished-recovery'
+        state.mkdir()
+        job_id, run_id = '7'*32, '8'*32
+        target = self.output / (MEETING_ID + '.mp4')
+        target.write_bytes(b'test mp4')
+        (web.ROOT / 'received').write_text(URL)
+        (web.ROOT / ('bbb-mp4-' + job_id + '.args')).write_text(json.dumps(['BBB_MP4_SIZE=1280x800']))
+        (state / 'jobs.json').write_text(json.dumps([{'id':job_id,'meeting_id':MEETING_ID,'url':URL,
+            'status':'running','phase':'verifying','run_id':run_id,'created':time.time(),
+            'duration':5,'capture_started':time.time(),'screenshot_time':None,'error':None}]))
+        jobs = web.Jobs(self.output, state)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and jobs.get(job_id)['status'] != 'done':
+            time.sleep(.05)
+        self.assertEqual(jobs.get(job_id)['status'], 'done')
+        self.assertEqual(target.read_bytes(), b'test mp4')
+        calls = (web.ROOT / 'calls').read_text()
+        self.assertNotIn('run --rm --name bbb-mp4-' + job_id, calls)
+
     def test_recovery_stops_orphaned_container(self):
         job_id = '1' * 32
         state = web.ROOT / 'recovery'
@@ -385,12 +537,16 @@ else: sys.exit(1)
         jobs = web.Jobs(self.output, state)
         self.assertFalse(old_workspace.exists())
         self.assertFalse(workspace.exists())
-        self.assertEqual(jobs.get(job_id)['status'], 'stopped')
+        self.assertIn(jobs.get(job_id)['status'], ('queued', 'running', 'done'))
         self.assertTrue((web.ROOT / ('bbb-mp4-' + job_id + '.stop')).exists())
         deadline = time.monotonic() + 6
         while time.monotonic() < deadline and jobs.get(queued_id)['status'] != 'done':
             time.sleep(.05)
         self.assertEqual(jobs.get(queued_id)['status'], 'done')
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and jobs.get(job_id)['status'] != 'done':
+            time.sleep(.05)
+        self.assertEqual(jobs.get(job_id)['status'], 'done')
 
 
 if __name__ == '__main__':
