@@ -30,6 +30,7 @@ FRAME_RATES = {15, 24, 25, 30, 50, 60}
 PRESETS = {'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'}
 DEFAULT_SETTINGS = {'resolution': '1280x800', 'video_bitrate': None, 'audio_bitrate': 128, 'preset': 'medium', 'codec': 'h264', 'fps': 30}
 MAX_ATTEMPTS = 3
+MAX_PARALLEL_JOBS = 3
 RETRY_DELAY = 5
 LOW_SPACE_BYTES = 1024 ** 3
 PREPARE_TIMEOUT = int(os.environ.get('BBB_MP4_PREPARE_TIMEOUT', '600'))
@@ -227,6 +228,9 @@ class Jobs:
         self.jobs = {}
         self.persistence_error = None
         self.worker_error = None
+        self.worker_errors = {}
+        self.worker_owners = {}
+        self.forced_workers = set()
         self.maintenance = False
         self.file_metadata = {}
         if self.state_file.exists():
@@ -238,6 +242,8 @@ class Jobs:
                 for key in ('run_id', 'cleanup_run_id'):
                     if job.get(key) is not None and not JOB_RE.fullmatch(job[key]):
                         raise ValueError('Некорректный идентификатор запуска')
+                if 'forced' in job and not isinstance(job['forced'], bool):
+                    raise ValueError('Некорректный признак принудительного запуска')
                 # Older jobs retain the original image's encoding settings.
                 if job.get('settings') is not None:
                     job['settings'] = validate_settings(job['settings'], allow_legacy=True)
@@ -253,7 +259,11 @@ class Jobs:
         with self.condition:
             self.save()
         self.operations = Operations(self)
-        threading.Thread(target=self.worker_guard, daemon=True, name='conversion-worker').start()
+        with self.condition:
+            for job in self.jobs.values():
+                if job.get('forced') and job['status'] == 'queued':
+                    self.start_forced_worker(job['id'])
+            threading.Thread(target=self.worker_guard, daemon=True, name='conversion-worker').start()
 
     def save(self):
         """Call with condition held; state includes URLs and is private to the service user."""
@@ -271,25 +281,66 @@ class Jobs:
                 print('Очередь ожидает восстановления записи состояния:', exc, flush=True)
                 self.condition.wait(timeout=5)
 
-    def worker_guard(self):
-        while True:
-            try:
-                self.worker()
-            except Exception as exc:
-                self.worker_error = str(exc)
-                print('Ошибка обработчика очереди; восстановление:', exc, flush=True)
-                # Never run the next job while an orphaned conversion may exist.
-                while True:
-                    try:
-                        with self.condition:
-                            self.recover()
-                            self.save_worker()
-                        self.worker_error = None
-                        break
-                    except Exception as recovery_error:
-                        self.worker_error = str(recovery_error)
-                        print('Восстановление очереди не удалось:', recovery_error, flush=True)
-                        time.sleep(5)
+    def set_worker_error(self, key, error):
+        # Called under condition; independent workers must not clear each
+        # other's errors and must never recover each other's containers.
+        if error is None:
+            self.worker_errors.pop(key, None)
+        else:
+            self.worker_errors[key] = str(error)
+        self.worker_error = '; '.join(self.worker_errors.values()) or None
+        self.condition.notify_all()
+
+    def start_forced_worker(self, job_id):
+        # Called with condition held. A forced retry keeps the same worker.
+        if job_id in self.forced_workers:
+            return
+        self.forced_workers.add(job_id)
+        try:
+            threading.Thread(target=self.worker_guard, args=(job_id,), daemon=True,
+                             name='forced-' + job_id).start()
+        except Exception:
+            self.forced_workers.remove(job_id)
+            raise
+
+    def worker_guard(self, forced_id=None):
+        key = forced_id or 'normal'
+        try:
+            while True:
+                try:
+                    self.worker(forced_id)
+                    return
+                except Exception as exc:
+                    with self.condition:
+                        self.set_worker_error(key, exc)
+                    print('Ошибка обработчика очереди; восстановление:', exc, flush=True)
+                    # Recover only this worker's job, never an unrelated running
+                    # conversion. Pause all new starts until cleanup is confirmed.
+                    while True:
+                        try:
+                            with self.condition:
+                                owner = self.worker_owners.get(key)
+                                job = self.jobs.get(owner) if owner else None
+                                if job:
+                                    self.recover([job])
+                                self.save_worker()
+                                self.worker_owners.pop(key, None)
+                                self.set_worker_error(key, None)
+                            break
+                        except Exception as recovery_error:
+                            with self.condition:
+                                self.set_worker_error(key, recovery_error)
+                            print('Восстановление очереди не удалось:', recovery_error, flush=True)
+                            time.sleep(5)
+        finally:
+            if forced_id:
+                with self.condition:
+                    self.forced_workers.discard(forced_id)
+                    job = self.jobs.get(forced_id)
+                    # Re-created/re-forced while the previous worker finished.
+                    if job and job['status'] == 'queued' and job.get('forced'):
+                        self.start_forced_worker(forced_id)
+                    self.condition.notify_all()
 
     def set_maintenance(self, enabled):
         if not isinstance(enabled, bool):
@@ -352,9 +403,9 @@ class Jobs:
                 raise KeyError(job_id)
             return job.get('log_tail', '')
 
-    def recover(self):
+    def recover(self, jobs=None):
         # First stop orphans. A requested stop must never be turned into a restart.
-        for job in self.jobs.values():
+        for job in (self.jobs.values() if jobs is None else jobs):
             if job['status'] in ('running', 'stopping'):
                 for prefix in ('bbb-mp4-', 'bbb-probe-'):
                     remove_container(prefix + job['id'])
@@ -460,7 +511,7 @@ class Jobs:
         job.update(status='queued', queued_at=time.time_ns(), run_id=secrets.token_hex(16), duration=None,
                    capture_started=None, screenshot_time=None, error=None, phase=None, log_tail='', space_warning=False,
                    verification=None, attempt=0, next_attempt=0, restart_count=0, recovery_source=None,
-                   delete_before_run=remove_existing)
+                   delete_before_run=remove_existing, forced=False)
         try:
             # Persist the deletion intent before touching the previous file.
             self.save()
@@ -482,7 +533,7 @@ class Jobs:
             (self.state_dir / (job['id'] + '.jpg')).unlink(missing_ok=True)
         except OSError as exc:
             self.log(job, 'Не удалось удалить прежнее превью: ' + str(exc) + '\n')
-        self.condition.notify()
+        self.condition.notify_all()
 
     def submit(self, url, overrides=None, replace_confirmed=False, duration_override=None):
         match = URL_RE.fullmatch(url)
@@ -534,7 +585,30 @@ class Jobs:
                 raise KeyError(job_id)
             if job.get('delete_requested') and action != 'delete':
                 raise ValueError('Удаление не завершено. Повторите удаление задания.')
-            if action == 'stop':
+            if action == 'force':
+                if self.maintenance or self.worker_error or self.persistence_error:
+                    raise ValueError('Очередь временно приостановлена. Проверьте состояние сервиса.')
+                if job['status'] != 'queued':
+                    raise ValueError('Принудительно можно запустить только ожидающее задание.')
+                now = time.time()
+                active = sum(j['status'] in ('running', 'stopping') for j in self.jobs.values())
+                reserved = sum(j['status'] == 'queued' and bool(j.get('forced')) and j['id'] != job_id
+                               and j.get('next_attempt', 0) <= now for j in self.jobs.values())
+                if active + reserved >= MAX_PARALLEL_JOBS:
+                    raise ValueError(f'Уже занято {MAX_PARALLEL_JOBS} слота конвертации. Дождитесь освобождения.')
+                previous = dict(job)
+                job.update(forced=True, next_attempt=0, error=None)
+                self.log(job, 'Запрошен принудительный запуск.\n')
+                try:
+                    self.save()
+                    self.start_forced_worker(job_id)
+                except Exception:
+                    job.clear()
+                    job.update(previous)
+                    self.save()
+                    raise
+                self.condition.notify_all()
+            elif action == 'stop':
                 if job['status'] == 'queued':
                     job.update(status='stopped', error=None)
                 elif job['status'] == 'running':
@@ -542,6 +616,7 @@ class Jobs:
                 else:
                     raise ValueError('Это задание сейчас нельзя остановить.')
                 self.save()
+                self.condition.notify_all()
             elif action == 'recreate':
                 if self.maintenance:
                     raise ValueError('Сервис обновляется. Попробуйте позже.')
@@ -637,41 +712,55 @@ class Jobs:
         command = ['docker', 'run', '--rm', '--name', name, '--entrypoint', program,
                    '-v', str(staged.parent) + ':/probe:ro', image_reference()] + arguments
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
-        deadline = time.monotonic() + timeout
-        stop_requested_at = None
-        while True:
-            try:
-                stdout, stderr = process.communicate(timeout=.5)
-                break
-            except subprocess.TimeoutExpired:
-                with self.condition:
-                    stopping = self.jobs[job_id]['status'] == 'stopping'
-                if stopping:
-                    if stop_requested_at is None:
-                        stop_requested_at = time.monotonic()
-                    if time.monotonic() - stop_requested_at > 30:
+        try:
+            deadline = time.monotonic() + timeout
+            stop_requested_at = None
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    with self.condition:
+                        stopping = self.jobs[job_id]['status'] == 'stopping'
+                    if stopping:
+                        if stop_requested_at is None:
+                            stop_requested_at = time.monotonic()
+                        if time.monotonic() - stop_requested_at > 30:
+                            process.kill()
+                            process.communicate()
+                            remove_container(name)
+                            return None
+                        try:
+                            subprocess.run(['docker', 'stop', '--time', '2', name], stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, timeout=10)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+                    if time.monotonic() >= deadline:
                         process.kill()
                         process.communicate()
                         remove_container(name)
-                        return None
+                        raise ConversionError('Превышено время проверки MP4.', retryable=True)
+            with self.condition:
+                stopping = self.jobs[job_id]['status'] == 'stopping'
+            if stopping:
+                remove_container(name)
+                return None
+            if process.returncode:
+                remove_container(name)
+                raise ConversionError(program + ' не смог проверить MP4: ' + (stderr.strip()[-500:] or f'код {process.returncode}'), process.returncode not in (125, 126, 127))
+            return stderr if return_stderr else stdout
+        finally:
+            if process.poll() is None:
+                try:
                     try:
-                        subprocess.run(['docker', 'stop', '--time', '2', name], stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL, timeout=10)
-                    except (OSError, subprocess.SubprocessError):
+                        process.kill()
+                    except ProcessLookupError:
                         pass
-                if time.monotonic() >= deadline:
-                    process.kill()
-                    process.communicate()
+                    process.communicate(timeout=10)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise OrphanContainerError('Не удалось остановить проверку MP4.') from exc
+                finally:
                     remove_container(name)
-                    raise ConversionError('Превышено время проверки MP4.', retryable=True)
-        with self.condition:
-            stopping = self.jobs[job_id]['status'] == 'stopping'
-        if stopping:
-            remove_container(name)
-            return None
-        if process.returncode:
-            raise ConversionError(program + ' не смог проверить MP4: ' + (stderr.strip()[-500:] or f'код {process.returncode}'), process.returncode not in (125, 126, 127))
-        return stderr if return_stderr else stdout
 
     def probe(self, job_id, staged, settings):
         """Check the container/streams and decode the entire new MP4."""
@@ -716,17 +805,33 @@ class Jobs:
             warnings.append('Большую часть записи может отсутствовать звук.')
         return {'duration': duration, 'warnings': warnings}
 
-    def worker(self):
+    def worker(self, forced_id=None):
+        key = forced_id or 'normal'
         while True:
             with self.condition:
-                if self.maintenance:
+                selected = self.jobs.get(forced_id) if forced_id else None
+                if forced_id and (not selected or selected['status'] != 'queued' or not selected.get('forced')):
+                    return
+                if self.maintenance or self.worker_error:
                     self.condition.wait()
                     continue
-                queued = [j for j in self.jobs.values() if j['status'] == 'queued']
                 now = time.time()
+                active = sum(j['status'] in ('running', 'stopping') for j in self.jobs.values())
+                busy_jobs = set(self.worker_owners.values())
+                if forced_id:
+                    queued = [selected] if selected['id'] not in busy_jobs else []
+                else:
+                    queued = [j for j in self.jobs.values() if j['status'] == 'queued'
+                              and not j.get('forced') and j['id'] not in busy_jobs]
                 ready = [j for j in queued if j.get('next_attempt', 0) <= now]
-                if not ready:
-                    delay = max(0.01, min(j.get('next_attempt', 0) for j in queued) - now) if queued else None
+                # Reserve free slots for already-requested forced jobs so the
+                # normal worker cannot overtake a just-clicked forced start.
+                forced_ready = sum(j['status'] == 'queued' and bool(j.get('forced'))
+                                   and j.get('next_attempt', 0) <= now for j in self.jobs.values())
+                full = active >= MAX_PARALLEL_JOBS or (not forced_id and active + forced_ready >= MAX_PARALLEL_JOBS)
+                if not ready or full:
+                    future = [j.get('next_attempt', 0) - now for j in queued if j.get('next_attempt', 0) > now]
+                    delay = max(0.01, min(future)) if future else None
                     self.condition.wait(timeout=delay)
                     continue
                 job = min(ready, key=lambda j: j.get('queued_at', 0))
@@ -738,6 +843,7 @@ class Jobs:
                         job.update(status='failed', error='Не удалось удалить прежний MP4: ' + str(exc)[:500])
                         self.save_worker()
                         continue
+                self.worker_owners[key] = job['id']
                 job['status'] = 'running'
                 job['attempt'] = job.get('attempt', 0) + 1
                 job['error'] = None
@@ -757,8 +863,10 @@ class Jobs:
             finished = threading.Event()
             workspace = self.workspace(job_id, run_id)
             orphaned = False
+            process = None
             try:
-                recovery_source = job.pop('recovery_source', None)
+                with self.condition:
+                    recovery_source = job.pop('recovery_source', None)
                 if recovery_source:
                     candidate = target if recovery_source == 'target' else workspace / target.name
                     with self.condition:
@@ -867,6 +975,9 @@ class Jobs:
                 process.stdout.close()
                 if timed_out:
                     raise ConversionError(timeout_reason + '; контейнер остановлен.', retryable=True)
+                # A failed Docker client is not proof that its container exited.
+                if process.returncode != 0:
+                    remove_container('bbb-mp4-' + job_id)
                 finished.set()
                 after = signature(staged)
                 with self.condition:
@@ -905,6 +1016,24 @@ class Jobs:
                 orphaned = True
                 raise
             except Exception as exc:
+                # Unexpected failures after Popen must not leave a Chrome/FFmpeg
+                # container running while a different job occupies its slot.
+                if process is not None and process.poll() is None:
+                    orphaned = True
+                    try:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                            process.wait(timeout=10)
+                        except (ProcessLookupError, subprocess.TimeoutExpired):
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.wait()
+                        remove_container('bbb-mp4-' + job_id)
+                        orphaned = False
+                    except (OSError, subprocess.SubprocessError, OrphanContainerError) as cleanup_error:
+                        raise OrphanContainerError('Не удалось подтвердить остановку конвертации.') from cleanup_error
                 print('Conversion failed:', exc, flush=True)
                 with self.condition:
                     self.log(job, '\nОшибка: ' + str(exc) + '\n')
@@ -938,6 +1067,10 @@ class Jobs:
                     event = dict(current) if current and current.get('run_id') == run_id and current['status'] in ('done', 'failed') else None
                 if event:
                     self.operations.completed(event)
+                if not orphaned:
+                    with self.condition:
+                        self.worker_owners.pop(key, None)
+                        self.condition.notify_all()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -977,7 +1110,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_json(202, {'message': 'Резервное копирование запланировано.'})
                 return
             else:
-                match = re.fullmatch(r'/jobs/([a-f0-9]{32})/(stop|delete|recreate)', self.path)
+                match = re.fullmatch(r'/jobs/([a-f0-9]{32})/(stop|delete|recreate|force)', self.path)
                 if not match:
                     self.send_error(404)
                     return

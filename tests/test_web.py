@@ -48,7 +48,10 @@ root = pathlib.Path(os.environ['MOCK_STATE'])
 with (root / 'calls').open('a') as log: log.write(' '.join(args[:4])+'\\n')
 if args[0] == 'run' and '--entrypoint' in args:
     with (root / 'inspect-args').open('a') as log: log.write(json.dumps(args)+'\\n')
-    url = (root / 'received').read_text()
+    name = args[args.index('--name') + 1].replace('bbb-probe-', 'bbb-mp4-')
+    run_args = json.loads((root / (name + '.args')).read_text())
+    url = next((v[len('REC_URL='):] for v in run_args if v.startswith('REC_URL=')), None)
+    if url is None: url = (root / 'received').read_text()
     program = args[args.index('--entrypoint') + 1]
     if program == 'ffmpeg':
         if 'case=decodeerror' in url: print('corrupt video frame', file=sys.stderr); sys.exit(1)
@@ -62,8 +65,6 @@ if args[0] == 'run' and '--entrypoint' in args:
         for _ in range(150):
             if (root / (name + '.stop')).exists(): sys.exit(143)
             time.sleep(.05)
-    name = args[args.index('--name') + 1].replace('bbb-probe-', 'bbb-mp4-')
-    run_args = json.loads((root / (name + '.args')).read_text())
     size = next((v.split('=',1)[1] for v in run_args if v.startswith('BBB_MP4_SIZE=')), '1280x800')
     width, height = map(int, size.split('x'))
     if 'case=wrongsize' in url: width += 2
@@ -91,7 +92,8 @@ elif args[0] == 'run':
     print('stderr: Output #0, mp4, to output.mp4', flush=True)
     if 'case=stallprogress' in url:
         pathlib.Path(mount, '.ffmpeg-progress').write_text('out_time_ms=1')
-        while True: time.sleep(1)
+        while not (root / (name + '.stop')).exists(): time.sleep(.05)
+        sys.exit(143)
     for _ in range(20):
         if (root / (name + '.stop')).exists():
             (root / (name + '.running')).unlink(missing_ok=True); sys.exit(143)
@@ -203,6 +205,206 @@ else: sys.exit(1)
         self.assertFalse(list(self.output.glob('.bbb-mp4-*')))
         self.assertEqual(self.json_request('/jobs/' + job_id)[0], 404)
         self.assertIn('stop --time 5 bbb-mp4-' + job_id, (web.ROOT / 'calls').read_text())
+
+    def test_forced_runs_parallel_with_limit_and_independent_stop(self):
+        def url(letter):
+            return URL.replace(MEETING_ID, letter*40 + '-1234567890123') + '?case=hang'
+        ids = [self.submit(url(letter))[1]['id'] for letter in 'abcde']
+        self.assertEqual(self.await_state(ids[0], {'running'})['status'], 'running')
+        self.assertEqual(self.json_request('/jobs/' + ids[0] + '/force', {})[0], 400)
+        self.assertEqual(self.json_request('/jobs/' + ids[1] + '/force', {})[0], 202)
+        self.assertEqual(self.json_request('/jobs/' + ids[2] + '/force', {})[0], 202)
+        self.assertTrue(self.await_state(ids[1], {'running'})['forced'])
+        self.assertTrue(self.await_state(ids[2], {'running'})['forced'])
+        self.assertEqual(self.json_request('/jobs/' + ids[3])[1]['status'], 'queued')
+        code, error = self.json_request('/jobs/' + ids[3] + '/force', {})
+        self.assertEqual(code, 400)
+        self.assertIn('3', error['error'])
+        self.assertEqual(self.json_request('/jobs/' + ids[1] + '/stop', {})[0], 202)
+        self.await_state(ids[1], {'stopped'})
+        self.assertEqual(self.json_request('/jobs/' + ids[0])[1]['status'], 'running')
+        self.assertEqual(self.json_request('/jobs/' + ids[2])[1]['status'], 'running')
+        # Normal queued jobs do not start just because a forced slot is free.
+        self.assertEqual(self.json_request('/jobs/' + ids[3])[1]['status'], 'queued')
+        self.assertEqual(self.json_request('/jobs/' + ids[3] + '/force', {})[0], 202)
+        self.assertTrue(self.await_state(ids[3], {'running'})['forced'])
+        # The next ordinary job starts after the ordinary worker is stopped.
+        self.assertEqual(self.json_request('/jobs/' + ids[0] + '/stop', {})[0], 202)
+        self.await_state(ids[0], {'stopped'})
+        self.assertFalse(self.await_state(ids[4], {'running'}).get('forced', False))
+        active = [j for j in self.json_request('/jobs')[1] if j['status'] in ('running','stopping')]
+        self.assertEqual(len(active), 3)
+        for job_id in (ids[2], ids[3], ids[4]):
+            self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
+        for job_id in (ids[2], ids[3], ids[4]):
+            self.await_state(job_id, {'stopped'})
+        self.assertIn('stop --time 5 bbb-mp4-' + ids[1], (web.ROOT / 'calls').read_text())
+
+    def test_force_is_rejected_during_maintenance(self):
+        jobs = self.server.jobs
+        with jobs.condition:
+            job_id = jobs.submit(URL + '?case=hang')
+            jobs.set_maintenance(True)
+        self.assertEqual(self.json_request('/jobs/' + job_id + '/force', {})[0], 400)
+        self.assertEqual(jobs.get(job_id)['status'], 'queued')
+        self.assertFalse(jobs.get(job_id).get('forced'))
+        jobs.action(job_id, 'stop')
+        jobs.set_maintenance(False)
+        self.assertEqual(jobs.get(job_id)['status'], 'stopped')
+
+    def test_forced_retries_stay_parallel_and_recreation_returns_to_normal_queue(self):
+        normal = self.submit(URL + '?case=hang')[1]['id']
+        self.await_state(normal, {'running'})
+        other = 'b'*40 + '-1234567890123'
+        forced = self.submit(URL.replace(MEETING_ID,other) + '?case=transient')[1]['id']
+        self.assertEqual(self.json_request('/jobs/' + forced + '/force', {})[0], 202)
+        result = self.await_state(forced, {'done'}, timeout=12)
+        self.assertEqual(result['attempt'], 2)
+        self.assertTrue(result['forced'])
+        self.assertEqual(self.server.jobs.get(normal)['status'], 'running')
+        self.assertEqual(self.json_request('/jobs/' + forced + '/recreate', {})[0], 202)
+        recreated = self.server.jobs.get(forced)
+        self.assertEqual(recreated['status'], 'queued')
+        self.assertFalse(recreated.get('forced'))
+        self.server.jobs.action(forced, 'stop')
+        self.server.jobs.action(normal, 'stop')
+        self.await_state(normal, {'stopped'})
+        self.await_state(forced, {'stopped'})
+
+    def test_stop_forced_during_retry_delay(self):
+        old_delay = web.RETRY_DELAY
+        web.RETRY_DELAY = 2
+        self.addCleanup(setattr, web, 'RETRY_DELAY', old_delay)
+        normal = self.submit(URL + '?case=hang')[1]['id']
+        self.await_state(normal, {'running'})
+        other = 'b'*40 + '-1234567890123'
+        forced = self.submit(URL.replace(MEETING_ID,other) + '?case=fail')[1]['id']
+        self.assertEqual(self.json_request('/jobs/' + forced + '/force', {})[0], 202)
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            job = self.server.jobs.get(forced)
+            if job['status']=='queued' and job['attempt']==1:
+                break
+            time.sleep(.05)
+        self.assertEqual(job['status'], 'queued')
+        self.assertTrue(job['forced'])
+        self.server.jobs.action(forced, 'stop')
+        self.assertEqual(self.await_state(forced, {'stopped'})['attempt'], 1)
+        self.assertEqual(self.server.jobs.get(normal)['status'], 'running')
+        self.server.jobs.action(normal, 'stop')
+        self.await_state(normal, {'stopped'})
+
+    def test_forced_cap_is_atomic_under_concurrent_clicks(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def url(letter):
+            return URL.replace(MEETING_ID, letter*40 + '-1234567890123') + '?case=hang'
+        ids = [self.submit(url(letter))[1]['id'] for letter in 'abcdef']
+        self.await_state(ids[0], {'running'})
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            codes = list(pool.map(lambda j: self.json_request('/jobs/' + j + '/force', {})[0], ids[1:]))
+        self.assertEqual(codes.count(202), 2)
+        self.assertEqual(codes.count(400), 3)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            jobs = self.json_request('/jobs')[1]
+            if sum(j['status'] == 'running' for j in jobs) == 3:
+                break
+            time.sleep(.05)
+        self.assertEqual(sum(j['status'] == 'running' for j in jobs), 3)
+        for job_id in ids:
+            status = self.json_request('/jobs/' + job_id)[1]['status']
+            if status in ('running','queued'):
+                self.assertEqual(self.json_request('/jobs/' + job_id + '/stop', {})[0], 202)
+        for job_id in ids:
+            self.await_state(job_id, {'stopped'})
+
+    def test_unexpected_forced_worker_error_cleans_up_only_its_container(self):
+        normal = self.submit(URL + '?case=hang')[1]['id']
+        self.await_state(normal, {'running'})
+        other = 'b'*40 + '-1234567890123'
+        forced = self.submit(URL.replace(MEETING_ID,other) + '?case=hang')[1]['id']
+        original = web.signature
+        triggered = threading.Event()
+        def broken_signature(path):
+            if ('.bbb-mp4-' + forced) in str(path) and (web.ROOT / ('bbb-mp4-' + forced + '.running')).exists() and not triggered.is_set():
+                triggered.set()
+                raise OSError('simulated unexpected read error')
+            return original(path)
+        web.signature = broken_signature
+        self.addCleanup(setattr, web, 'signature', original)
+        self.assertEqual(self.json_request('/jobs/' + forced + '/force', {})[0], 202)
+        self.await_state(forced, {'failed'})
+        self.assertTrue(triggered.is_set())
+        self.assertEqual(self.server.jobs.get(normal)['status'], 'running')
+        calls = (web.ROOT / 'calls').read_text()
+        self.assertIn('rm -f bbb-mp4-' + forced, calls)
+        self.assertNotIn('rm -f bbb-mp4-' + normal, calls)
+        self.server.jobs.action(normal, 'stop')
+        self.await_state(normal, {'stopped'})
+
+    def test_forced_orphan_recovery_never_stops_other_job(self):
+        old_timeout, original_remove = web.STALL_TIMEOUT, web.remove_container
+        web.STALL_TIMEOUT = .3
+        self.addCleanup(setattr, web, 'STALL_TIMEOUT', old_timeout)
+        self.addCleanup(setattr, web, 'remove_container', original_remove)
+        normal = self.submit(URL + '?case=hang')[1]['id']
+        self.await_state(normal, {'running'})
+        other = 'b'*40 + '-1234567890123'
+        forced = self.submit(URL.replace(MEETING_ID,other) + '?case=stallprogress')[1]['id']
+        allowed = threading.Event()
+        def remove(name):
+            if name == 'bbb-mp4-' + forced and not allowed.is_set():
+                raise web.OrphanContainerError('simulated orphan')
+            return original_remove(name)
+        web.remove_container = remove
+        self.assertEqual(self.json_request('/jobs/' + forced + '/force', {})[0], 202)
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and not self.server.jobs.worker_error:
+            time.sleep(.05)
+        self.assertIsNotNone(self.server.jobs.worker_error)
+        self.assertEqual(self.server.jobs.get(normal)['status'], 'running')
+        self.assertNotIn('rm -f bbb-mp4-' + normal, (web.ROOT / 'calls').read_text())
+        pending_id = self.submit(URL.replace(MEETING_ID, 'c'*40 + '-1234567890123'))[1]['id']
+        self.assertEqual(self.json_request('/jobs/' + pending_id + '/force', {})[0], 400)
+        self.assertEqual(self.server.jobs.get(pending_id)['status'], 'queued')
+        allowed.set()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and self.server.jobs.worker_error:
+            time.sleep(.05)
+        self.assertIsNone(self.server.jobs.worker_error)
+        self.assertEqual(self.server.jobs.get(normal)['status'], 'running')
+        self.assertNotIn('rm -f bbb-mp4-' + normal, (web.ROOT / 'calls').read_text())
+        self.server.jobs.action(pending_id, 'stop')
+        for job_id in (normal, forced):
+            status = self.server.jobs.get(job_id)['status']
+            if status in ('queued','running'):
+                self.server.jobs.action(job_id, 'stop')
+        for job_id in (normal, forced, pending_id):
+            self.await_state(job_id, {'stopped'})
+
+    def test_forced_queue_survives_restart_and_cap(self):
+        state = web.ROOT / 'forced-recovery'
+        state.mkdir()
+        jobs_data = []
+        for index, letter in enumerate('abc'):
+            meeting_id = letter*40 + '-1234567890123'
+            jobs_data.append({'id':str(index+1)*32, 'meeting_id':meeting_id,
+                              'url':URL.replace(MEETING_ID,meeting_id)+'?case=hang',
+                              'status':'running', 'run_id':str(index+4)*32,
+                              'created':time.time(), 'duration':None, 'capture_started':None,
+                              'screenshot_time':None, 'error':None, 'forced':index>0})
+        (state / 'jobs.json').write_text(json.dumps(jobs_data))
+        jobs = web.Jobs(self.output, state)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and sum(j['status']=='running' for j in jobs.list()) < 3:
+            time.sleep(.05)
+        self.assertEqual(sum(j['status']=='running' for j in jobs.list()), 3)
+        self.assertEqual(sum(bool(j.get('forced')) for j in jobs.list()), 2)
+        for job in jobs.list(): jobs.action(job['id'], 'stop')
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and any(j['status']!='stopped' for j in jobs.list()):
+            time.sleep(.05)
+        self.assertTrue(all(j['status']=='stopped' for j in jobs.list()))
 
     def test_failure_stale_output_and_persistence_import(self):
         # Existing files from the old in-memory version remain visible.

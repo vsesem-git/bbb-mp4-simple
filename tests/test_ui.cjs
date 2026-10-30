@@ -6,6 +6,7 @@ const {JSDOM} = require('jsdom');
 const html = fs.readFileSync(path.join(__dirname, '..', 'web.html'), 'utf8');
 let globalSettings = {codec:'h264',resolution:'1280x720',video_bitrate:3333,audio_bitrate:144,preset:'fast',fps:30};
 const requests = [];
+let jobList = [];
 const dom = new JSDOM(html, {url:'http://127.0.0.1:8080/', runScripts:'dangerously', beforeParse(w) {
   w.setInterval = () => 0;
   w.confirm = () => true;
@@ -18,7 +19,7 @@ const dom = new JSDOM(html, {url:'http://127.0.0.1:8080/', runScripts:'dangerous
       }
       return {ok:true,json:async()=>({id:'1'.repeat(32)})};
     }
-    const result = url==='/settings' ? globalSettings : url==='/jobs' ? [] : url==='/disk' ? {low:false,volumes:[]} : {operations:{backup_configured:false,notification_configured:false}};
+    const result = url==='/settings' ? globalSettings : url==='/jobs' ? jobList : url==='/disk' ? {low:false,volumes:[]} : {operations:{backup_configured:false,notification_configured:false}};
     return {ok:true,json:async()=>result};
   };
 }});
@@ -56,5 +57,18 @@ const change = (el, value) => {el.value=value; el.dispatchEvent(new dom.window.E
   const req=requests.find(x=>x.url==='/jobs');
   assert.deepStrictEqual(JSON.parse(JSON.stringify(req.body.settings)), {resolution:'2560x1080',fps:'25',preset:'slow',video_bitrate:'3333',audio_bitrate:'192'});
   assert.equal(globalSettings.fps,60);
+  const job = (id,status,forced=false) => ({id,meeting_id:'a'.repeat(40)+'-1234567890123',url:'https://example.org',created:1,status,forced});
+  jobList=[job('1'.repeat(32),'running'),job('2'.repeat(32),'queued')];
+  await dom.window.refresh(); await tick();
+  let forceButton=[...d.querySelectorAll('button')].find(b=>b.textContent==='Принудительно');
+  assert(forceButton && !forceButton.disabled, 'queued job should have force button');
+  forceButton.click(); await tick(); await tick();
+  assert(requests.some(x=>x.url==='/jobs/'+'2'.repeat(32)+'/force'));
+  jobList=[job('1'.repeat(32),'running'),job('3'.repeat(32),'running',true),job('4'.repeat(32),'stopping',true),job('2'.repeat(32),'queued')];
+  await dom.window.refresh(); await tick();
+  forceButton=[...d.querySelectorAll('button')].find(b=>b.textContent==='Принудительно');
+  assert(forceButton.disabled, 'force button must be disabled at the three-job cap');
+  assert(el('count').textContent.includes('3 / 3'));
+  assert(d.body.textContent.includes('Принудительный запуск'));
   console.log('UI tests passed'); dom.window.close();
 })().catch(e=>{console.error(e);dom.window.close();process.exitCode=1;});
