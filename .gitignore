@@ -1,0 +1,4 @@
+.env
+recordings/
+__pycache__/
+state/
